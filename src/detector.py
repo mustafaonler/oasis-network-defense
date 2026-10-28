@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OASIS detector v0: rule-based Port Scan detection on sensor windows."""
+"""OASIS detector v1: rule-based Port Scan and SYN Flood detection."""
 import json
 import sys
 import time
@@ -7,6 +7,7 @@ import time
 WINDOWS_FILE = "data/windows.jsonl"
 ALERTS_FILE = "data/alerts.jsonl"
 PORT_SCAN_MIN_PORTS = 20      # distinct SYN ports in one window
+SYN_FLOOD_MIN_RATE = 50       # SYN per second from one source
 WHITELIST = {"10.0.1.1"}      # sources that never raise alerts
 
 
@@ -21,6 +22,15 @@ def check(rec):
             "attack_type": "port_scan",
             "reason": f"{rec['unique_ports']} distinct ports probed in one window "
                       f"(threshold {PORT_SCAN_MIN_PORTS})",
+            "evidence": rec,
+        }
+    if rec["syn_per_second"] >= SYN_FLOOD_MIN_RATE:
+        return {
+            "time": rec["window_end"],
+            "source_ip": rec["source_ip"],
+            "attack_type": "syn_flood",
+            "reason": f"{rec['syn_per_second']} SYN/s toward {rec['unique_ports']} port(s) "
+                      f"(threshold {SYN_FLOOD_MIN_RATE} SYN/s)",
             "evidence": rec,
         }
     return None
