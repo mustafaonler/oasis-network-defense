@@ -60,6 +60,11 @@ def apply_block(ip, seconds):
     return r.returncode == 0, r.stderr.strip()
 
 
+def nft_blocked(ip):
+    """True if the IP is really in the firewall blocklist (source of truth)."""
+    return nft("get", "element", "inet", "oasis", "blocklist", f"{{ {ip} }}").returncode == 0
+
+
 def whitelisted(ip):
     addr = ipaddress.ip_address(ip)
     return any(addr in net for net in WHITELIST)
@@ -86,7 +91,7 @@ def process(alert, db, enforce):
 
     if whitelisted(ip):
         action = "skip_whitelist"
-    elif blocked_until.get(ip, 0) > now:
+    elif (nft_blocked(ip) if enforce else blocked_until.get(ip, 0) > now):
         action = "skip_already_blocked"
     elif risk == "low":
         action = "log_only"
