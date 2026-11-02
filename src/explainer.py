@@ -12,7 +12,8 @@ import sys
 import time
 
 DB_FILE = "data/oasis.db"
-MODEL = os.environ.get("OASIS_MODEL", "claude-haiku-5-5")
+MODELS = {"gemini": os.environ.get("OASIS_MODEL", "gemini-2.5-flash"),
+          "anthropic": os.environ.get("OASIS_MODEL", "claude-haiku-5-5")}
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
@@ -76,22 +77,49 @@ def template_text(p):
     return f"{why} Risk seviyesi {p['risk']}, kaynak {dur} engellendi."
 
 
-def llm_text(p):
+def llm_text_gemini(p, model):
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    r = client.models.generate_content(
+        model=model, contents=json.dumps(p),
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM, max_output_tokens=4000, temperature=0))
+    if not r.text:
+        raise ValueError("empty response")
+    reason = str(r.candidates[0].finish_reason) if r.candidates else ""
+    if "STOP" not in reason:
+        raise ValueError("incomplete response: " + reason)
+    return r.text.strip()
+
+
+def llm_text_anthropic(p, model):
     import anthropic
     client = anthropic.Anthropic(timeout=20)
     msg = client.messages.create(
-        model=MODEL, max_tokens=400, system=SYSTEM,
+        model=model, max_tokens=400, system=SYSTEM,
         messages=[{"role": "user", "content": json.dumps(p)}])
     return msg.content[0].text.strip()
 
 
+def pick_provider():
+    if os.environ.get("GEMINI_API_KEY"):
+        return "gemini"
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    return None
+
+
 def explain(p, mock):
-    if mock or not os.environ.get("ANTHROPIC_API_KEY"):
+    provider = None if mock else pick_provider()
+    if provider is None:
         return "mock", template_text(p)
+    model = MODELS[provider]
     try:
-        return MODEL, llm_text(p)
+        fn = llm_text_gemini if provider == "gemini" else llm_text_anthropic
+        return f"{provider}:{model}", fn(p, model)
     except Exception as e:
-        return "mock(fallback)", template_text(p) + f" [LLM hatası: {type(e).__name__}]"
+        return "mock(fallback)", template_text(p) + f" [LLM hatasi: {type(e).__name__}]"
 
 
 def run_once(db, mock):
