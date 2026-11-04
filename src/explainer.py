@@ -7,6 +7,7 @@ Usage: python src/explainer.py [--mock] [--watch]
 """
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -110,6 +111,34 @@ def pick_provider():
     return None
 
 
+WINDOW_SECONDS = 5
+
+
+def allowed_numbers(p):
+    nums = {float(WINDOW_SECONDS)}
+    for v in p["evidence"].values():
+        if isinstance(v, (int, float)):
+            nums.add(float(v))
+    for v in p["rule_threshold"].values():
+        nums.add(float(v))
+    d = p["block_duration_seconds"]
+    if isinstance(d, (int, float)):
+        nums.add(float(d))
+        nums.add(d / 60)
+    return nums
+
+
+def verify(text, p):
+    """Return the numbers in text that the evidence does not back."""
+    allowed = allowed_numbers(p)
+    bad = []
+    for tok in re.findall(r"\d+(?:[.,]\d+)?", text):
+        val = float(tok.replace(",", "."))
+        if not any(abs(val - a) < 1e-9 for a in allowed):
+            bad.append(tok)
+    return bad
+
+
 def explain(p, mock):
     provider = None if mock else pick_provider()
     if provider is None:
@@ -117,9 +146,13 @@ def explain(p, mock):
     model = MODELS[provider]
     try:
         fn = llm_text_gemini if provider == "gemini" else llm_text_anthropic
-        return f"{provider}:{model}", fn(p, model)
+        text = fn(p, model)
     except Exception as e:
         return "mock(fallback)", template_text(p) + f" [LLM hatasi: {type(e).__name__}]"
+    bad = verify(text, p)
+    if bad:
+        return "mock(fallback)", template_text(p) + " [Dogrulama basarisiz, kanitta olmayan sayilar: " + ", ".join(bad) + "]"
+    return f"{provider}:{model} (verified)", text
 
 
 def run_once(db, mock):

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start OASIS (sensor, detector, responder) in one root tmux session.
+# Start OASIS (sensor, detector, responder, explainer) in one tmux session.
 # Usage: ./scripts/start.sh [--enforce]
 cd "$(dirname "$0")/.." || exit 1
 MODE="${1:-}"
@@ -12,6 +12,8 @@ sudo tmux kill-session -t $S 2>/dev/null
 sudo tmux new-session -d -s $S -n sensor ".venv/bin/python src/sensor.py"
 sudo tmux new-window -t $S -n detector ".venv/bin/python src/detector.py"
 sudo tmux new-window -t $S -n responder ".venv/bin/python src/responder.py $MODE"
-sleep 2
-sudo chown -R "$U":"$U" data   # root programs create files; hand them back to the user
+sleep 3
+sudo chown -R "$U":"$U" data   # hand root-created files back to the user
+# the explainer does not need root: run it as the normal user
+sudo tmux new-window -t $S -n explainer "sudo -u $U .venv/bin/python src/explainer.py --watch"
 sudo tmux attach -t $S
