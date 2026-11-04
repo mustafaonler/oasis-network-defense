@@ -81,7 +81,8 @@ def template_text(p):
 def llm_text_gemini(p, model):
     from google import genai
     from google.genai import types
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
+                         http_options=types.HttpOptions(timeout=20000))
     r = client.models.generate_content(
         model=model, contents=json.dumps(p),
         config=types.GenerateContentConfig(
@@ -146,7 +147,7 @@ def explain(p, mock):
     model = MODELS[provider]
     try:
         fn = llm_text_gemini if provider == "gemini" else llm_text_anthropic
-        text = fn(p, model)
+        text = fn(p, model).replace("`", "").replace("**", "")
     except Exception as e:
         return "mock(fallback)", template_text(p) + f" [LLM hatasi: {type(e).__name__}]"
     bad = verify(text, p)
