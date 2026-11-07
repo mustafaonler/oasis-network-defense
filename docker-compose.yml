@@ -1,0 +1,66 @@
+# OASIS Docker lab. Stage A: gateway, attacker, victim.
+name: oasis
+
+services:
+  gateway:
+    build:
+      context: ./docker
+      dockerfile: gateway/Dockerfile
+    image: oasis/gateway:dev
+    hostname: oasis-gw
+    init: true
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    environment:
+      OASIS_GW_IPS: "10.10.1.254 10.10.2.254"
+    networks:
+      attacker-net:
+        ipv4_address: 10.10.1.254
+      victim-net:
+        ipv4_address: 10.10.2.254
+
+  victim:
+    build:
+      context: ./docker
+      dockerfile: victim/Dockerfile
+    image: oasis/victim:dev
+    init: true
+    cap_add: [NET_ADMIN]
+    environment:
+      OASIS_GW: 10.10.2.254
+    networks:
+      victim-net:
+        ipv4_address: 10.10.2.10
+    depends_on: [gateway]
+
+  # No fixed IP: --scale attacker=N takes addresses from ip_range.
+  attacker:
+    build:
+      context: ./docker
+      dockerfile: attacker/Dockerfile
+    image: oasis/attacker:dev
+    init: true
+    cap_add: [NET_ADMIN, NET_RAW]
+    environment:
+      OASIS_GW: 10.10.1.254
+    networks: [attacker-net]
+    depends_on: [gateway]
+
+# Not "internal": Docker would then drop routed traffic between the subnets.
+# The lab stays offline instead by: no NAT here, no default route and the
+# lab_isolation table on the gateway. Packages are installed at build time.
+networks:
+  attacker-net:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+          ip_range: 10.10.1.64/26   # auto addresses .64-.127
+  victim-net:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
