@@ -1,5 +1,6 @@
 # OASIS Docker lab. Stage A: gateway, attacker, victim.
 # Stage B: sensor, detector, responder (least privilege, shared data volume).
+# Stage C: explainer, specialist (LLM agents on the mgmt network).
 name: oasis
 
 x-core: &core
@@ -11,6 +12,23 @@ x-core: &core
   cap_drop: [ALL]
   volumes:
     - oasis-data:/app/data
+
+# LLM agents: only on mgmt (internet, no lab access), keys from .env at runtime.
+x-agent: &agent
+  build:
+    context: .
+    dockerfile: docker/agents/Dockerfile
+  image: oasis/agents:dev
+  init: true
+  cap_drop: [ALL]
+  restart: on-failure   # e.g. started before responder created the events table
+  volumes:
+    - oasis-data:/app/data
+  env_file:
+    - path: .env
+      required: false   # no .env: explainer/specialist fall back to templates
+  networks: [mgmt]
+  depends_on: [responder]
 
 services:
   gateway:
@@ -91,6 +109,14 @@ services:
     environment: *whitelist
     depends_on: [gateway, detector]
 
+  explainer:
+    <<: *agent
+    command: ["python", "src/explainer.py", "--watch"]
+
+  specialist:
+    <<: *agent
+    command: ["python", "src/specialist.py", "--watch"]
+
 # Not "internal": Docker would then drop routed traffic between the subnets.
 # The lab stays offline instead by: no NAT here, no default route and the
 # lab_isolation table on the gateway. Packages are installed at build time.
@@ -108,6 +134,11 @@ networks:
     ipam:
       config:
         - subnet: 10.10.2.0/24
+  # The only network with internet access (NAT on), for LLM API calls.
+  mgmt:
+    ipam:
+      config:
+        - subnet: 10.10.9.0/24
 
 volumes:
   oasis-data:
