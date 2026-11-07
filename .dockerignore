@@ -1,0 +1,7 @@
+# Never send secrets, local state or history into an image.
+.git
+.env
+.env.*
+.venv
+data/
+**/__pycache__

@@ -1,17 +1,39 @@
 #!/usr/bin/env python3
-"""OASIS sensor: summarizes traffic in fixed time windows (JSON lines)."""
+"""OASIS sensor: summarizes traffic in fixed time windows (JSON lines).
+
+Defaults are the VM lab; the Docker lab overrides them with OASIS_* variables.
+"""
+import ipaddress
 import json
+import os
+import sys
 import threading
 import time
 from collections import defaultdict
 from datetime import datetime
 
-from scapy.all import sniff, IP, TCP
+from scapy.all import sniff, IP, TCP, get_if_addr, get_if_list
 
-IFACE = "enp0s3"
 WINDOW = 5  # seconds
-BPF = "ip and src net 10.0.1.0/24 and not src host 10.0.1.1"
+# Validated with ipaddress so only real addresses reach the BPF filter.
+SRC_NET = str(ipaddress.ip_network(os.environ.get("OASIS_SRC_NET", "10.0.1.0/24")))
+IGNORE = [str(ipaddress.ip_address(h.strip())) for h in
+          os.environ.get("OASIS_SENSOR_IGNORE", "10.0.1.1").split(",") if h.strip()]
+BPF = f"ip and src net {SRC_NET}" + "".join(f" and not src host {h}" for h in IGNORE)
 OUTFILE = "data/windows.jsonl"
+
+
+def find_iface():
+    """OASIS_IFACE, else the interface holding OASIS_GW_IP, else the VM NIC."""
+    if os.environ.get("OASIS_IFACE"):
+        return os.environ["OASIS_IFACE"]
+    gw_ip = os.environ.get("OASIS_GW_IP")
+    if gw_ip:
+        for name in get_if_list():
+            if get_if_addr(name) == gw_ip:
+                return name
+        sys.exit(f"no interface holds {gw_ip}")
+    return "enp0s3"
 
 
 def new_stats():
@@ -63,11 +85,13 @@ def flusher(out):
 
 
 def main():
-    print(f"Sensor started on {IFACE}, window={WINDOW}s. Ctrl+C to stop.", flush=True)
+    iface = find_iface()
+    print(f"Sensor started on {iface}, window={WINDOW}s. Ctrl+C to stop.", flush=True)
+    print(f"BPF: {BPF}", flush=True)
     with open(OUTFILE, "a") as out:
         threading.Thread(target=flusher, args=(out,), daemon=True).start()
         try:
-            sniff(iface=IFACE, filter=BPF, prn=handle, store=False)
+            sniff(iface=iface, filter=BPF, prn=handle, store=False)
         except KeyboardInterrupt:
             print("Stopped.")
 

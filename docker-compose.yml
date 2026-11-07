@@ -1,5 +1,16 @@
 # OASIS Docker lab. Stage A: gateway, attacker, victim.
+# Stage B: sensor, detector, responder (least privilege, shared data volume).
 name: oasis
+
+x-core: &core
+  build:
+    context: .
+    dockerfile: docker/core/Dockerfile
+  image: oasis/core:dev
+  init: true
+  cap_drop: [ALL]
+  volumes:
+    - oasis-data:/app/data
 
 services:
   gateway:
@@ -14,6 +25,8 @@ services:
       net.ipv4.ip_forward: "1"
     environment:
       OASIS_GW_IPS: "10.10.1.254 10.10.2.254"
+    # Also covers sensor and responder, which share this network namespace.
+    dns: [10.10.1.254]   # no DNS server there: external names fail (no DNS leak)
     networks:
       attacker-net:
         ipv4_address: 10.10.1.254
@@ -49,6 +62,35 @@ services:
     networks: [attacker-net]
     depends_on: [gateway]
 
+  # Sniffs the gateway's attacker-side interface (found from OASIS_GW_IP).
+  sensor:
+    <<: *core
+    command: ["python3", "src/sensor.py"]
+    network_mode: "service:gateway"
+    cap_add: [NET_RAW]
+    environment:
+      OASIS_GW_IP: 10.10.1.254
+      OASIS_SRC_NET: 10.10.1.0/24
+      OASIS_SENSOR_IGNORE: "10.10.1.1,10.10.1.254"
+    depends_on: [gateway]
+
+  # Only reads and writes files: no network, no capabilities.
+  detector:
+    <<: *core
+    command: ["sh", "-c", "touch data/windows.jsonl data/alerts.jsonl && exec python3 src/detector.py"]
+    network_mode: none
+    environment: &whitelist
+      OASIS_WHITELIST: "10.10.1.1,10.10.1.254,10.10.2.1,10.10.2.254,10.10.2.10"
+
+  # Writes nft rules into the gateway's network namespace.
+  responder:
+    <<: *core
+    command: ["python3", "src/responder.py", "--enforce"]
+    network_mode: "service:gateway"
+    cap_add: [NET_ADMIN]
+    environment: *whitelist
+    depends_on: [gateway, detector]
+
 # Not "internal": Docker would then drop routed traffic between the subnets.
 # The lab stays offline instead by: no NAT here, no default route and the
 # lab_isolation table on the gateway. Packages are installed at build time.
@@ -66,3 +108,6 @@ networks:
     ipam:
       config:
         - subnet: 10.10.2.0/24
+
+volumes:
+  oasis-data:
