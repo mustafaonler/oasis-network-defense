@@ -29,6 +29,7 @@ services:
     cap_add: [NET_ADMIN]
     environment:
       OASIS_GW: 10.10.2.254
+    dns: [10.10.2.254]   # no DNS server there: external names fail (no DNS leak)
     networks:
       victim-net:
         ipv4_address: 10.10.2.10
@@ -44,6 +45,7 @@ services:
     cap_add: [NET_ADMIN, NET_RAW]
     environment:
       OASIS_GW: 10.10.1.254
+    dns: [10.10.1.254]   # no DNS server there: external names fail (no DNS leak)
     networks: [attacker-net]
     depends_on: [gateway]
 
