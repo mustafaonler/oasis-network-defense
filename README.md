@@ -40,6 +40,7 @@ The working VM version stays on `main` and is tagged **`demo-v2`**.
 | `explainer.py` | Explains each block in Turkish (3–4 sentences), number-verified | Yes (numbers only) | No |
 | `specialist.py` | Router picks `PortScanAgent` or `SynFloodAgent` for a second opinion (JSON) | Yes (numbers only) | No |
 | `unblock.py` | Manual unblock, logged to the event table | No | **Yes** |
+| `policy.py` | Action ladder constants and the repeat count, shared by the responder and the agents (no firewall code) | No | No |
 
 **Block duration ladder** (`responder.py`): `LADDER = [5 min, 30 min, until manual unblock]`.
 The start step comes from the risk level (`port_scan` = medium → step 0,
@@ -199,6 +200,17 @@ C6 first failed: google-genai 3.x uses the `v1` API by default, and there
 `gemini-2.5-flash` rejects `system_instruction` (HTTP 400). Both agents fell back to
 templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
 
+### Fix: repeat count in the LLM payload
+
+| # | Test | Result |
+|---|---|---|
+| F1-R | Responder dry-run scenario (repeats, expiry, whitelist, unknown type, bad IP): same DB rows and output as `main` (VM env) and as the previous commit (VM and Docker env) | Pass |
+| F1-A | Agents do not load `responder.py`; `policy.py` imports nothing | Pass |
+| P1 | For every stored block, the computed ladder step matches the duration the responder applied | Pass |
+| P2 | Template explanations give the repeat count as the reason | Pass |
+| P3 | Same new IP blocked twice: 5 min (start step), then 30 min with "1 prior block" as the reason; both agents `(verified)` | Pass |
+| P4 | New payloads contain no IP address and no free text | Pass |
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -225,8 +237,10 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
   when switching providers.
 - **LLM explanations can be wrong even when every number checks out.** The number check
   catches invented numbers, not wrong reasoning. Seen in testing:
-  - The payload has no repeat count, so the explainer once said a manual block was due
-    to "medium risk" when the real cause was repeat escalation.
+  - Before the repeat count was added to the payload, the explainer said a 30-minute
+    block was due to "medium risk" when the real cause was repeat escalation. The payload
+    now carries `repeat_rule`, and the explanations give the right reason. They sometimes
+    quote raw field names such as `start_step_for_risk` in the Turkish text.
   - `unique_dst_ips` also counts nmap's reverse-DNS query to the gateway, and the
     specialist read it as a second scan target.
   - The specialist suggested `raise` for a 30-port scan against a threshold of 20.
@@ -248,11 +262,12 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
 - Stage C (C1–C6): explainer and specialist on an isolated mgmt network, keys only from
   `.env` at runtime, template fallback without a key, numeric-only LLM payloads, real
   Gemini calls verified with `gemini-2.5-flash` and `gemini-3.5-flash-lite`
+- Repeat count and ladder step in the LLM payload (`repeat_rule`, from the shared
+  `policy.py`): explanations now give the real reason for a block duration. The responder's
+  behaviour is unchanged (dry-run regression against `main` and the previous commit).
 
 ### Planned
 
-- Add the repeat count (`prior_blocks_last_hour`) and the ladder step to the LLM payload,
-  so explanations can give the real reason for a block duration
 - Stage D: `docker compose up --scale attacker=3` (several attackers at once)
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
 - Automated tests for the detection rules and the action ladder

@@ -12,6 +12,8 @@ import subprocess
 import sys
 import time
 
+from policy import LADDER, REPEAT_WINDOW, START_STEP
+
 ALERTS_FILE = "data/alerts.jsonl"
 DB_FILE = "data/oasis.db"
 
@@ -22,9 +24,6 @@ WHITELIST = [ipaddress.ip_network(n.strip()) for n in os.environ.get(
     if n.strip()]
 
 RISK = {"port_scan": "medium", "syn_flood": "high"}
-START_STEP = {"medium": 0, "high": 1}
-LADDER = [300, 1800, None]   # seconds; None = until removed manually
-REPEAT_WINDOW = 3600         # seconds: a repeat offender escalates
 
 blocked_until = {}           # ip -> unix time (inf = manual)
 
