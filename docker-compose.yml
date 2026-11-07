@@ -90,6 +90,7 @@ services:
       OASIS_GW_IP: 10.10.1.254
       OASIS_SRC_NET: 10.10.1.0/24
       OASIS_SENSOR_IGNORE: "10.10.1.1,10.10.1.254"
+      OASIS_SENSOR_DNS_SERVER: 10.10.1.254   # attackers' DNS (see dns: above)
     depends_on: [gateway]
 
   # Only reads and writes files: no network, no capabilities.

@@ -211,6 +211,14 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
 | P3 | Same new IP blocked twice: 5 min (start step), then 30 min with "1 prior block" as the reason; both agents `(verified)` | Pass |
 | P4 | New payloads contain no IP address and no free text | Pass |
 
+### Fix: DNS lookups not counted as scan targets
+
+| # | Test | Result |
+|---|---|---|
+| R1 | VM settings (no `OASIS_*`): BPF, interface and statistics for the same in-memory packets are identical to `main` | Pass |
+| R2 | Docker settings, in-memory packets: a DNS lookup to the gateway is no longer a target; a SYN to the gateway's port 22 still is; DNS to another server still is; packet counts unchanged | Pass |
+| R3 | Live 30-port scan: `unique_dst_ips` is 1 (was 2), `port_scan` alert as before | Pass |
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -220,6 +228,12 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
   application-layer attacks, brute force and similar attacks.
 - **One direction only.** The sensor watches traffic from `attacker-net`. Traffic that
   starts on the victim side is not analyzed. The lab is IPv4 only; IPv6 is dropped.
+- **Small blind spot from the DNS fix.** In the Docker lab, packets to the gateway on
+  port 53 (UDP or TCP) are not counted in `unique_dst_ips`, because that is the lab's DNS
+  server address. A probe of the gateway's port 53 therefore does not add the gateway as a
+  target. It is still counted in `packet_count`, and a TCP SYN to port 53 still counts as a
+  probed port. Probes of the gateway's other ports are counted as usual. The VM version
+  is unchanged (`OASIS_SENSOR_DNS_SERVER` unset).
 - **Spoofing.** A SYN flood with spoofed source addresses could make the responder block
   innocent addresses. The whitelist protects only the lab infrastructure.
 - **File-based messaging.** Components exchange data through JSONL files and one SQLite
@@ -241,8 +255,9 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
     block was due to "medium risk" when the real cause was repeat escalation. The payload
     now carries `repeat_rule`, and the explanations give the right reason. They sometimes
     quote raw field names such as `start_step_for_risk` in the Turkish text.
-  - `unique_dst_ips` also counts nmap's reverse-DNS query to the gateway, and the
-    specialist read it as a second scan target.
+  - `unique_dst_ips` used to count nmap's reverse-DNS query to the gateway, and the
+    specialist read it as a second scan target. Fixed: the sensor no longer counts DNS
+    lookups to the lab DNS server as targets (see the blind spot below).
   - The specialist suggested `raise` for a 30-port scan against a threshold of 20.
     Opinions are advisory and never change the risk level.
   - With `gemini-3.5-flash-lite` the specialist attached real numbers to the wrong fields
@@ -265,6 +280,8 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
 - Repeat count and ladder step in the LLM payload (`repeat_rule`, from the shared
   `policy.py`): explanations now give the real reason for a block duration. The responder's
   behaviour is unchanged (dry-run regression against `main` and the previous commit).
+- Sensor ignores DNS lookups to the lab DNS server when counting targets
+  (`OASIS_SENSOR_DNS_SERVER`); VM behaviour unchanged.
 
 ### Planned
 
