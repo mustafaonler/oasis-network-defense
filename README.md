@@ -150,6 +150,11 @@ docker compose exec responder python3 src/unblock.py <attacker-ip>
 
 # watch traffic pass through the gateway
 docker compose exec gateway tcpdump -ni any icmp
+
+# several attackers: start three, run a command in the second one, go back to one
+docker compose up -d --scale attacker=3
+docker compose exec --index 2 attacker nmap -Pn -sS -p 1-30 10.10.2.10
+docker compose up -d --scale attacker=1
 ```
 
 Stop the lab with `docker compose down`. To also delete the event database, add `-v`.
@@ -219,11 +224,29 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
 | R2 | Docker settings, in-memory packets: a DNS lookup to the gateway is no longer a target; a SYN to the gateway's port 22 still is; DNS to another server still is; packet counts unchanged | Pass |
 | R3 | Live 30-port scan: `unique_dst_ips` is 1 (was 2), `port_scan` alert as before | Pass |
 
+### Stage D — several attackers (`--scale attacker=3`)
+
+| # | Test | Result |
+|---|---|---|
+| D1 | Three attackers get distinct IPs from `10.10.1.64/26`; route and DNS point at the gateway | Pass |
+| D2 | A ping from each attacker crosses the gateway (three source IPs in tcpdump) | Pass |
+| D3 | Simultaneous 30-port scans: three windows, three `port_scan` alerts, three blocks; durations follow each IP's own history | Pass |
+| D4 | Unblocking one attacker restores only that attacker; the other two stay blocked | Pass |
+| D5 | Distributed scan (10 ports per attacker, 30 in total): no alert, as expected for per-source rules (see limitations) | Pass |
+| D6 | The agents handled all three events: six verified LLM results, no rate-limit errors | Pass |
+| D7 | Blocklist empty, back to one attacker | Pass |
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
   A slow scan (fewer than 20 new ports per window) is not detected. A scan that straddles
   two windows can stay under the threshold in both.
+- **Per-source rules miss distributed scans.** Each source IP is judged on its own. Three
+  attackers that each probe 10 ports (30 in total) raise no alert, because none of them
+  reaches the 20-port threshold (Stage D, test D5).
+- **Recycled lab IPs keep their history.** Docker hands a freed address to the next
+  attacker container, so a new container can inherit an old IP's recent blocks and get a
+  longer block on its first scan.
 - **Only two attack types** (port scan, SYN flood). There is no detection for UDP floods,
   application-layer attacks, brute force and similar attacks.
 - **One direction only.** The sensor watches traffic from `attacker-net`. Traffic that
@@ -282,11 +305,13 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
   behaviour is unchanged (dry-run regression against `main` and the previous commit).
 - Sensor ignores DNS lookups to the lab DNS server when counting targets
   (`OASIS_SENSOR_DNS_SERVER`); VM behaviour unchanged.
+- Stage D: three attackers at once (`--scale attacker=3`), each detected, blocked and
+  unblocked independently
 
 ### Planned
 
-- Stage D: `docker compose up --scale attacker=3` (several attackers at once)
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
+- Detection across sources (distributed scans), for example per-target port counts
 - Automated tests for the detection rules and the action ladder
 - Further README and documentation edits
 
