@@ -190,7 +190,11 @@ expected result written down before it ran.
 | C3 | Without a key: `[mock]` explanations and `[rules]` opinions for all block events | Pass |
 | C4 | From the explainer: ping and TCP to victim and attacker fail; mgmt and internet pings work | Pass |
 | C5 | LLM payloads for real events contain no IP address and no free text | Pass |
-| C6 | Real LLM call with a key (`(verified)` label) | Pending |
+| C6 | Real LLM call with a Gemini key: both agents labelled `gemini:gemini-2.5-flash (verified)` | Pass |
+
+C6 first failed: google-genai 3.x uses the `v1` API by default, and there
+`gemini-2.5-flash` rejects `system_instruction` (HTTP 400). Both agents fell back to
+templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
 
 ## Known limitations
 
@@ -216,6 +220,14 @@ expected result written down before it ran.
   model, is deprecated by Google (earliest shutdown 1 December 2026). Set `OASIS_MODEL`
   to a current model. `OASIS_MODEL` is shared by both providers, so change or remove it
   when switching providers.
+- **LLM explanations can be wrong even when every number checks out.** The number check
+  catches invented numbers, not wrong reasoning. Seen in testing:
+  - The payload has no repeat count, so the explainer once said a manual block was due
+    to "medium risk" when the real cause was repeat escalation.
+  - `unique_dst_ips` also counts nmap's reverse-DNS query to the gateway, and the
+    specialist read it as a second scan target.
+  - The specialist suggested `raise` for a 30-port scan against a threshold of 20.
+    Opinions are advisory and never change the risk level.
 - **No automated test suite.** The tests above are manual command sequences.
 - **Tested only on Docker Desktop for Windows.** Other Docker hosts may behave differently.
 
@@ -227,12 +239,15 @@ expected result written down before it ran.
   nftables blocklist, lab isolation, DNS leak closed
 - Stage B: sensor, detector and responder as separate least-privilege services; VM
   defaults kept through `OASIS_*` variables
-- Stage C (C1–C5): explainer and specialist on an isolated mgmt network, keys only from
-  `.env` at runtime, template fallback without a key, numeric-only LLM payloads
+- Stage C (C1–C6): explainer and specialist on an isolated mgmt network, keys only from
+  `.env` at runtime, template fallback without a key, numeric-only LLM payloads, real
+  Gemini calls verified
 
 ### Planned
 
-- Stage C6: real LLM test with an API key and a current model (`OASIS_MODEL`)
+- Add the repeat count (`prior_blocks_last_hour`) and the ladder step to the LLM payload,
+  so explanations can give the real reason for a block duration
+- Choose a current Gemini model with `OASIS_MODEL` and re-run C6 with it
 - Stage D: `docker compose up --scale attacker=3` (several attackers at once)
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
 - Automated tests for the detection rules and the action ladder

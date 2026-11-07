@@ -142,8 +142,9 @@ def call_llm(provider, model, system, payload):
     if provider == "gemini":
         from google import genai
         from google.genai import types
+        # v1beta: on the v1 API (google-genai 3.x default) some models reject system_instruction.
         client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
-                              http_options=types.HttpOptions(timeout=20000))
+                              http_options=types.HttpOptions(timeout=20000, api_version="v1beta"))
         r = client.models.generate_content(
             model=model, contents=json.dumps(payload),
             config=types.GenerateContentConfig(
