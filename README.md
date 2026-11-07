@@ -106,8 +106,10 @@ cp .env.example .env
 
 Open `.env` in an editor and fill in **one** provider key (`GEMINI_API_KEY` or
 `ANTHROPIC_API_KEY`). `.env` is ignored by git and never copied into an image.
-`OASIS_MODEL` can override the model. Leave that line commented out unless you set a
-value, because an empty `OASIS_MODEL=` makes every LLM call fail.
+`OASIS_MODEL` can override the model. With Gemini, `OASIS_MODEL=gemini-3.5-flash-lite`
+was tested and is recommended, because the code default `gemini-2.5-flash` is deprecated.
+Leave that line commented out unless you set a value, because an empty `OASIS_MODEL=`
+makes every LLM call fail.
 
 ### Start
 
@@ -191,6 +193,7 @@ expected result written down before it ran.
 | C4 | From the explainer: ping and TCP to victim and attacker fail; mgmt and internet pings work | Pass |
 | C5 | LLM payloads for real events contain no IP address and no free text | Pass |
 | C6 | Real LLM call with a Gemini key: both agents labelled `gemini:gemini-2.5-flash (verified)` | Pass |
+| C6b | Same test with `OASIS_MODEL=gemini-3.5-flash-lite`: both agents labelled `gemini:gemini-3.5-flash-lite (verified)` | Pass |
 
 C6 first failed: google-genai 3.x uses the `v1` API by default, and there
 `gemini-2.5-flash` rejects `system_instruction` (HTTP 400). Both agents fell back to
@@ -228,6 +231,9 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
     specialist read it as a second scan target.
   - The specialist suggested `raise` for a 30-port scan against a threshold of 20.
     Opinions are advisory and never change the risk level.
+  - With `gemini-3.5-flash-lite` the specialist attached real numbers to the wrong fields
+    ("30 SYN out of 30.0 packets" when there were 33 packets). The check only asks whether
+    a number appears in the payload, not which field it belongs to.
 - **No automated test suite.** The tests above are manual command sequences.
 - **Tested only on Docker Desktop for Windows.** Other Docker hosts may behave differently.
 
@@ -241,13 +247,12 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
   defaults kept through `OASIS_*` variables
 - Stage C (C1–C6): explainer and specialist on an isolated mgmt network, keys only from
   `.env` at runtime, template fallback without a key, numeric-only LLM payloads, real
-  Gemini calls verified
+  Gemini calls verified with `gemini-2.5-flash` and `gemini-3.5-flash-lite`
 
 ### Planned
 
 - Add the repeat count (`prior_blocks_last_hour`) and the ladder step to the LLM payload,
   so explanations can give the real reason for a block duration
-- Choose a current Gemini model with `OASIS_MODEL` and re-run C6 with it
 - Stage D: `docker compose up --scale attacker=3` (several attackers at once)
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
 - Automated tests for the detection rules and the action ladder
