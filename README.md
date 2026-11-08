@@ -41,6 +41,7 @@ The working VM version stays on `main` and is tagged **`demo-v2`**.
 | `specialist.py` | Router picks `PortScanAgent` or `SynFloodAgent` for a second opinion (JSON) | Yes (numbers only) | No |
 | `unblock.py` | Manual unblock, logged to the event table | No | **Yes** |
 | `policy.py` | Action ladder constants and the repeat count, shared by the responder and the agents (no firewall code) | No | No |
+| `dashboard.py` | Read-only web view of `oasis.db` for the analyst: lab diagram, events, explanations, opinions, active blocks | No | No |
 
 **Block duration ladder** (`responder.py`): `LADDER = [5 min, 30 min, until manual unblock]`.
 The start step comes from the risk level (`port_scan` = medium → step 0,
@@ -67,6 +68,10 @@ one step up. Unblocking does not reset that count.
               ┌────────────┐ ┌────────────┐
               │ explainer  │ │ specialist │ ──> LLM API (Gemini or Anthropic)
               └────────────┘ └────────────┘
+                 dash 10.10.8.0/24 (only network of the dashboard)
+              ┌────────────┐
+              │ dashboard  │ ──> 127.0.0.1:8080 on the host; oasis-data mounted read-only
+              └────────────┘
 ```
 
 How the lab is kept offline and isolated:
@@ -84,6 +89,8 @@ How the lab is kept offline and isolated:
 
 Least privilege: every OASIS service starts with `cap_drop: [ALL]`. Only the sensor gets
 `NET_RAW` and only the responder gets `NET_ADMIN`. The detector has no network at all.
+The dashboard gets no capabilities, runs as `nobody` with a read-only root file system and
+`no-new-privileges`, mounts `oasis-data` read-only and is not on the lab or mgmt networks.
 `.env`, `data/` and `.git` are excluded from images by `.dockerignore`.
 
 ## Setup and usage
@@ -158,6 +165,32 @@ docker compose up -d --scale attacker=1
 ```
 
 Stop the lab with `docker compose down`. To also delete the event database, add `-v`.
+
+### Dashboard
+
+Open <http://127.0.0.1:8080> on the Docker host. The page refreshes every 5 seconds and shows:
+
+- **Lab diagram** with a status per host: *engelli* (blocked), *alarm* (an attack event in
+  the last 5 minutes) or *normal*. Attackers shown are the IPs with an event in the last
+  hour or a block still in force.
+- **Active blocks** with a live countdown, computed from the event log only (newest
+  enforce-mode `block` per IP, minus later `unblock` events and expired durations).
+  The dashboard never asks the gateway.
+- **Events** (newest 200). Click a row for the rule reason, the explainer text, the
+  specialist opinion and the sensor evidence.
+
+Security: only `GET` is served, the `Host` header must be `127.0.0.1:8080` or
+`localhost:8080` (against DNS rebinding), a strict Content-Security-Policy allows only the
+page's own files, and every database string is written with `textContent`, so it is shown
+as plain text and never parsed as HTML. The page loads nothing from a CDN.
+If you publish the dashboard on another host port, change `OASIS_DASH_HOSTS` to match.
+
+Unit tests for the dashboard (run inside its image, no Python needed on the host):
+
+```bash
+docker compose build dashboard
+docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/dashboard:dev python3 -m unittest discover -s tests -v
+```
 
 ## Test results
 
@@ -236,6 +269,18 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
 | D6 | The agents handled all three events: six verified LLM results, no rate-limit errors | Pass |
 | D7 | Blocklist empty, back to one attacker | Pass |
 
+### Dashboard
+
+| # | Test | Result |
+|---|---|---|
+| U1 | 17 unit tests: blocklist from the log (active, expired, unblocked, re-blocked, manual, `block_failed`, dry-run, `unblock_failed`), host status, read-only connection, missing DB not created, CSP, no HTML sinks in the JS, raw text in the API, wrong `Host` → 403, non-GET → 405, no file access from the URL | Pass |
+| K1 | `docker inspect`: no added capabilities, all dropped (CapEff 0), `oasis-data` mounted `RW=false`, user `nobody`, read-only root, port bound to `127.0.0.1:8080`, only on the `dash` network | Pass |
+| K2 | From inside the container: writing to the volume and the root file system fails; a normal SQLite `INSERT` fails (read-only database); TCP to victim and gateway times out | Pass |
+| K3 | Live 30-port scan: event, `blocked` status, 5-minute countdown, explainer text and specialist opinion appear in the browser | Pass |
+| K4 | `unblock.py`: the IP leaves the block list, status turns to `alarm`, the `unblock` event is listed | Pass |
+| K5 | Browser loads resources only from `http://127.0.0.1:8080`; no horizontal page scroll at 375 px and 1024 px | Pass |
+| K6 | Separate test DB with HTML and script payloads in every text field: shown as plain text, no `<img>`/`<b>`/extra `<script>` elements, no injected attributes or classes, page title unchanged | Pass |
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -286,7 +331,16 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
   - With `gemini-3.5-flash-lite` the specialist attached real numbers to the wrong fields
     ("30 SYN out of 30.0 packets" when there were 33 packets). The check only asks whether
     a number appears in the payload, not which field it belongs to.
-- **No automated test suite.** The tests above are manual command sequences.
+- **Dashboard shows the log, not the firewall.** Active blocks are computed from the event
+  table. After `docker compose down` (without `-v`) or a gateway restart the nftables set is
+  empty, but the dashboard still shows the logged blocks until they expire, and manual
+  blocks until an `unblock` is logged. Host status also comes from events, not from
+  Docker: a stopped container is not shown as stopped (reading that would need the Docker
+  socket, which is root on the host). The `dash` network has outbound internet access,
+  because Docker publishes no ports on `internal` networks; the dashboard makes no outbound
+  requests.
+- **No automated test suite for the pipeline.** The tests above are manual command
+  sequences; only the dashboard has unit tests.
 - **Tested only on Docker Desktop for Windows.** Other Docker hosts may behave differently.
 
 ## Status
@@ -307,6 +361,8 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
   (`OASIS_SENSOR_DNS_SERVER`); VM behaviour unchanged.
 - Stage D: three attackers at once (`--scale attacker=3`), each detected, blocked and
   unblocked independently
+- Read-only web dashboard on `127.0.0.1:8080`: lab diagram with host status, event list,
+  explanations and opinions, active blocks computed from the log
 
 ### Planned
 

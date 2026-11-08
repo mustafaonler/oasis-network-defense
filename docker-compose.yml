@@ -1,6 +1,7 @@
 # OASIS Docker lab. Stage A: gateway, attacker, victim.
 # Stage B: sensor, detector, responder (least privilege, shared data volume).
 # Stage C: explainer, specialist (LLM agents on the mgmt network).
+# Dashboard: read-only web view on 127.0.0.1:8080.
 name: oasis
 
 x-core: &core
@@ -118,6 +119,26 @@ services:
     <<: *agent
     command: ["python", "src/specialist.py", "--watch"]
 
+  # Read-only web view of oasis.db. No capabilities, no writes, no lab or mgmt access.
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard/Dockerfile
+    image: oasis/dashboard:dev
+    init: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    user: "65534:65534"
+    volumes:
+      - oasis-data:/app/data:ro
+    environment:
+      OASIS_DASH_BIND: 0.0.0.0                            # inside the container only
+      OASIS_DASH_HOSTS: "127.0.0.1:8080,localhost:8080"   # Host header allowlist
+    ports:
+      - "127.0.0.1:8080:8080"                             # host loopback only
+    networks: [dash]
+
 # Not "internal": Docker would then drop routed traffic between the subnets.
 # The lab stays offline instead by: no NAT here, no default route and the
 # lab_isolation table on the gateway. Packages are installed at build time.
@@ -140,6 +161,11 @@ networks:
     ipam:
       config:
         - subnet: 10.10.9.0/24
+  # Dashboard only. Not "internal": Docker publishes no ports on internal networks.
+  dash:
+    ipam:
+      config:
+        - subnet: 10.10.8.0/24
 
 volumes:
   oasis-data:
