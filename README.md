@@ -326,6 +326,10 @@ process that sends its counts ten times a second.
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
   A slow scan (fewer than 20 new ports per window) is not detected. A scan that straddles
   two windows can stay under the threshold in both.
+- **A fast attack can finish before the block.** Alerts come only when a 5-second window
+  closes, and the responder acts after that. A fast scan can be over before its window ends
+  (in testing, nmap probed 30 ports in 0.1 s and the block came about 4 s later). The block
+  then stops the attacker's next step, not the scan that triggered it.
 - **Per-source rules miss distributed scans.** Each source IP is judged on its own. Three
   attackers that each probe 10 ports (30 in total) raise no alert, because none of them
   reaches the 20-port threshold (Stage D, test D5).
