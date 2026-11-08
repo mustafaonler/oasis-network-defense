@@ -99,12 +99,19 @@ main { max-width: 1280px; margin: 0 auto; padding: 16px 24px 48px; display: grid
 #diagram text.st-alarm { fill: var(--alarm); font-weight: 600; font-size: 11.5px; }
 #diagram text.st-blocked { fill: var(--blocked); font-weight: 600; font-size: 11.5px; }
 #diagram text.net { fill: var(--muted); font-size: 11px; }
+#diagram text.pps { font-family: var(--mono); font-size: 12px; font-weight: 600; fill: var(--accent); }
+#diagram .wire.lane { stroke-dasharray: 2 4; }
+#diagram .pkt { fill: var(--accent); }
+#diagram .pkt.drop { fill: var(--blocked); }
 
 .legend { list-style: none; display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 0; margin: 10px 0 6px; font-size: 0.85rem; }
 .dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
 .dot.normal { background: var(--normal); }
 .dot.alarm { background: var(--alarm); }
 .dot.blocked { background: var(--blocked); }
+.dot.pkt { background: var(--accent); width: 8px; height: 8px; }
+.dot.drop { background: var(--blocked); width: 8px; height: 8px; }
+.statuses { display: flex; flex-direction: column; gap: 2px; }
 
 /* Tables */
 .table-wrap { overflow-x: auto; min-width: 0; }

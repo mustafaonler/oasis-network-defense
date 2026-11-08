@@ -13,7 +13,10 @@
     <h1>OASIS Panel</h1>
     <p class="sub">Salt okunur izleme · veriler <code>oasis.db</code> olay kayıtlarından</p>
   </div>
-  <p id="status" class="status" role="status">Yükleniyor…</p>
+  <div class="statuses">
+    <p id="status" class="status" role="status">Yükleniyor…</p>
+    <p id="live-status" class="status stale">Canlı akış: bağlanıyor…</p>
+  </div>
 </header>
 
 <main>
@@ -33,9 +36,15 @@
       <li><span class="dot normal"></span>normal</li>
       <li><span class="dot alarm"></span>alarm (son <span id="alarm-min">5</span> dk içinde saldırı olayı)</li>
       <li><span class="dot blocked"></span>engelli</li>
+      <li><span class="dot pkt"></span>ölçülen paket (gateway'den geçti)</li>
+      <li><span class="dot drop"></span>gateway'de kaldı (iletilmedi)</li>
     </ul>
     <p class="note">Durumlar Docker'dan değil, olay kayıtlarından hesaplanır. Saldırganlar:
-      son 1 saatte olayı olan veya hâlâ engelli IP'ler.</p>
+      son 1 saatte olayı olan, hâlâ engelli olan veya son 10 sn'de trafik gönderen IP'ler.</p>
+    <p class="note">Canlı akış sensörün saniyelik ölçümünden gelir: ölçülen her saniye için
+      10 pkt/s'ye kadar 1 nokta = 1 paket, üstünde logaritmik ölçek. Kesin değer kutudaki pkt/s.
+      Victim'e geçen noktaların oranı, gateway'in victim tarafında ölçülen iletilen paket
+      oranıdır. Yanıt paketleri gösterilmez.</p>
   </section>
 
   <section class="panel">

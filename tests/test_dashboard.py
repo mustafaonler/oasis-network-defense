@@ -147,6 +147,136 @@ class ReadOnly(unittest.TestCase):
             self.assertEqual(st["events"], [])
 
 
+def live_doc(updated, seconds):
+    return {"updated": updated, "interval": 1, "seconds": seconds}
+
+
+class LiveFile(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "live.json")
+        self.now = 2_000_000.0
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def put(self, doc):
+        with open(self.path, "w") as f:
+            f.write(doc if isinstance(doc, str) else json.dumps(doc))
+
+    def test_valid_data_passes(self):
+        good = {"pkts": 5, "syn": 1, "ports": 1, "fwd": 5}
+        self.put(live_doc(self.now - 0.5, [{"t": 1999999, "sources": {"10.10.1.64": good}}]))
+        r = dashboard.read_live(self.path, self.now)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["stale"])
+        self.assertEqual(r["seconds"][0]["sources"]["10.10.1.64"], good)
+
+    def test_bad_values_dropped(self):
+        ok = {"pkts": 1, "syn": 0, "ports": 0, "fwd": 1}
+        self.put(live_doc(self.now, [{"t": 1, "sources": {
+            "10.10.1.64": ok,
+            XSS: ok,                                                   # not an IP
+            "10.10.1.65": {"pkts": -1, "syn": 0, "ports": 0, "fwd": 0},
+            "10.10.1.66": {"pkts": 1.5, "syn": 0, "ports": 0, "fwd": 0},
+            "10.10.1.67": {"pkts": True, "syn": 0, "ports": 0, "fwd": 0},
+            "10.10.1.68": {"pkts": "9", "syn": 0, "ports": 0, "fwd": 0},
+            "10.10.1.69": {"pkts": 1},                                 # missing counters
+        }}, {"t": "x", "sources": {}}, "junk"]))
+        r = dashboard.read_live(self.path, self.now)
+        self.assertEqual(len(r["seconds"]), 1)
+        self.assertEqual(list(r["seconds"][0]["sources"]), ["10.10.1.64"])
+
+    def test_stale_missing_bad_and_large(self):
+        self.put(live_doc(self.now - 10, []))
+        self.assertTrue(dashboard.read_live(self.path, self.now)["stale"])
+        self.put("not json")
+        self.assertFalse(dashboard.read_live(self.path, self.now)["ok"])
+        self.put("[1, 2]")
+        self.assertFalse(dashboard.read_live(self.path, self.now)["ok"])
+        self.put(" " * (dashboard.LIVE_MAX_BYTES + 1))
+        self.assertFalse(dashboard.read_live(self.path, self.now)["ok"])
+        os.remove(self.path)
+        r = dashboard.read_live(self.path, self.now)
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["stale"])
+
+    def test_limits(self):
+        many = {f"10.10.1.{i}": {"pkts": 1, "syn": 0, "ports": 0, "fwd": 0} for i in range(100)}
+        self.put(live_doc(self.now, [{"t": t, "sources": many} for t in range(30)]))
+        r = dashboard.read_live(self.path, self.now)
+        self.assertEqual([s["t"] for s in r["seconds"]], list(range(20, 30)))
+        self.assertEqual(len(r["seconds"][0]["sources"]), dashboard.LIVE_MAX_SOURCES)
+
+
+def sse_open(port, host):
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    c.putrequest("GET", "/api/live", skip_host=True)
+    c.putheader("Host", host)
+    c.endheaders()
+    return c, c.getresponse()
+
+
+def sse_next(r):
+    while True:
+        line = r.fp.readline().decode()
+        if line.startswith("data: "):
+            return json.loads(line[6:])
+
+
+class LiveStream(unittest.TestCase):
+    def setUp(self):
+        self.f = Fixture()
+        self.live = os.path.join(self.f.dir.name, "live.json")
+        with open(self.live, "w") as fh:
+            json.dump(live_doc(time.time(), [{"t": int(time.time()), "sources": {
+                "10.10.1.64": {"pkts": 3, "syn": 0, "ports": 0, "fwd": 0}}}]), fh)
+        self.srv = dashboard.make_server("127.0.0.1", 0, self.f.path, {"good.test:1"}, self.live)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.f.close()
+
+    def test_stream_sends_live_data(self):
+        c, r = sse_open(self.port, "good.test:1")
+        self.assertEqual(r.status, 200)
+        self.assertTrue(r.getheader("Content-Type").startswith("text/event-stream"))
+        self.assertIn("default-src 'none'", r.getheader("Content-Security-Policy"))
+        msg = sse_next(r)
+        self.assertEqual(msg["seconds"][0]["sources"]["10.10.1.64"]["pkts"], 3)
+        # sensor rewrites the file -> a new message arrives
+        with open(self.live, "w") as fh:
+            json.dump(live_doc(time.time(), [{"t": int(time.time()), "sources": {}}]), fh)
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            if sse_next(r)["seconds"][0]["sources"] == {}:
+                break
+        else:
+            self.fail("no update after the file changed")
+        c.close()
+
+    def test_stream_wrong_host(self):
+        c, r = sse_open(self.port, "evil.example:1")
+        self.assertEqual(r.status, 403)
+        c.close()
+
+    def test_stream_limit(self):
+        open_streams = []
+        for _ in range(dashboard.SSE_MAX):
+            c, r = sse_open(self.port, "good.test:1")
+            self.assertEqual(r.status, 200)
+            sse_next(r)
+            open_streams.append(c)
+        c, r = sse_open(self.port, "good.test:1")
+        self.assertEqual(r.status, 503)
+        c.close()
+        for c in open_streams:
+            c.close()
+
+
 class Http(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

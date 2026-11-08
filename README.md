@@ -34,7 +34,7 @@ The working VM version stays on `main` and is tagged **`demo-v2`**.
 
 | Component | Role | Talks to the LLM? | Touches the firewall? |
 |---|---|---|---|
-| `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries | No | No |
+| `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, a per-second live summary for the dashboard) | No | No |
 | `detector.py` | Rules: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood` | No | No |
 | `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log | No | **Yes** |
 | `explainer.py` | Explains each block in Turkish (3–4 sentences), number-verified | Yes (numbers only) | No |
@@ -62,7 +62,7 @@ one step up. Unblocking does not reset that count.
                                       │  sensor (NET_RAW)        │
                                       │  responder (NET_ADMIN)   │
                                       └──────────────────────────┘
-   detector: network_mode none         oasis-data volume: windows.jsonl, alerts.jsonl, oasis.db
+   detector: network_mode none         oasis-data volume: windows.jsonl, alerts.jsonl, oasis.db, live.json
                                        (shared by sensor, detector, responder, explainer, specialist)
                  mgmt 10.10.9.0/24 (NAT on — the only network with internet access)
               ┌────────────┐ ┌────────────┐
@@ -179,17 +179,36 @@ Open <http://127.0.0.1:8080> on the Docker host. The page refreshes every 5 seco
 - **Events** (newest 200). Click a row for the rule reason, the explainer text, the
   specialist opinion and the sensor evidence.
 
+**Live traffic.** In the Docker lab the sensor also writes `data/live.json`: per-source
+packet, SYN and distinct-port counts for each of the last 10 seconds, rewritten atomically
+every second (under 1 KB in tests, at most about 64 sources × 10 seconds). It also counts,
+per source, the packets that really leave the gateway on the victim side (a raw socket
+with a kernel BPF filter, in a child process so it never slows the scapy sniffer). The
+dashboard pushes this file to the browser as Server-Sent Events (`/api/live`, at most 4
+streams). The diagram then shows:
+
+- a live `pkt/s` value on every attacker box, and `incoming · forwarded pkt/s` on the gateway;
+- dots on the attacker → gateway → victim path. For every measured second a source gets
+  one dot per packet up to 10 pkt/s, above that a log scale (at most 30 dots per source per
+  second, 120 on screen). The share of dots that cross to the victim is the measured
+  forwarded share; the rest stop at the gateway in red. A blocked attacker's dots all stop
+  at the gateway, because nothing of it leaves on the victim side.
+
+No traffic means no dots. With the sensor stopped, the page says so and draws nothing.
+`OASIS_LIVE_FILE` unset (the VM) turns all of this off and the sensor behaves as before.
+
 Security: only `GET` is served, the `Host` header must be `127.0.0.1:8080` or
 `localhost:8080` (against DNS rebinding), a strict Content-Security-Policy allows only the
 page's own files, and every database string is written with `textContent`, so it is shown
 as plain text and never parsed as HTML. The page loads nothing from a CDN.
 If you publish the dashboard on another host port, change `OASIS_DASH_HOSTS` to match.
 
-Unit tests for the dashboard (run inside its image, no Python needed on the host):
+Unit tests (run inside the images, no Python needed on the host):
 
 ```bash
-docker compose build dashboard
-docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/dashboard:dev python3 -m unittest discover -s tests -v
+docker compose build dashboard sensor
+docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/dashboard:dev python3 -m unittest discover -s tests -p test_dashboard.py -v
+docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_sensor.py -v
 ```
 
 ## Test results
@@ -281,6 +300,27 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
 | K5 | Browser loads resources only from `http://127.0.0.1:8080`; no horizontal page scroll at 375 px and 1024 px | Pass |
 | K6 | Separate test DB with HTML and script payloads in every text field: shown as plain text, no `<img>`/`<b>`/extra `<script>` elements, no injected attributes or classes, page title unchanged | Pass |
 
+### Dashboard: live traffic
+
+The browser checks used a small test driver that called the page's own `frame()` about
+60 times a second (the browser pane was in the background, where animation frames do not
+run) and measured the time of every frame. The dots came from the real SSE stream.
+
+| # | Test | Result |
+|---|---|---|
+| U2 | Unit tests: sensor windows identical with the live summary on and off for the same in-memory packets; VM defaults (BPF, interface, live off); per-second counts; 64-source cap; live file keeps 10 seconds, no temp file, stops growing. Dashboard: bad IPs and non-integer counters dropped, stale / missing / oversized / malformed file, 10-second and 64-source limits, SSE headers and CSP, update after the file changes, wrong `Host` → 403, fifth stream → 503 (24 + 5 tests) | Pass |
+| L1 | One attacker: ping shows 1 pkt/s and one dot per second reaching the victim; curl ×3 shows 6 and 12 pkt/s; nmap (15 ports) shows 18 in / 15 forwarded, the 3 not forwarded are packets to the gateway itself and stop there in red. Values appear about 1 s after the traffic | Pass |
+| L2 | Traffic stops: `pkt/s` back to 0 within about 1 s, dots in flight finish within 3 s, no new dots afterwards. No traffic, no dots | Pass |
+| L3 | Three attackers ping at 1, 2 and 5 pkt/s at once: three boxes, three paths, values 1/2/5; a traffic-only attacker leaves the diagram 10 s after its last packet | Pass |
+| L4 | Continuous ping (5 pkt/s) plus a 30-port scan from the same attacker: forwarded 5/5 before the block, 5/0 after it; every dot stops at the gateway; box turns `blocked`. An ACK flood from the blocked attacker: 4171 in, 0 forwarded, no dot past the gateway | Pass |
+| L5 | ACK flood, 20000 packets at about 6500 pkt/s, sensor with the live summary on (5 runs) and off (4 runs): captured 19862–20000 on, 19947–20000 off; forwarded counter 20000 in every run; CPU about the same. Browser during the flood and the README SYN flood: 53–63 frames/s, average frame 0.06 ms, worst 2.6 ms, at most 64 dots, constant SVG node count, no heap growth | Pass |
+| L6 | `live.json` stayed between 600 and 900 bytes during the floods; no temp file left in `data/` | Pass |
+
+L5 failed in the first version: the forwarded counter ran as a thread in the sensor
+process and competed with the scapy sniffer for the GIL. Under the flood it missed 19–25 %
+of forwarded packets and the 5-second windows lost up to 5.5 %. It now runs as a child
+process that sends its counts ten times a second.
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -339,6 +379,14 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
   socket, which is root on the host). The `dash` network has outbound internet access,
   because Docker publishes no ports on `internal` networks; the dashboard makes no outbound
   requests.
+- **Live view limits.** Only attacker → victim traffic is shown; replies are not. Values
+  have one-second resolution, and forwarded counts arrive in 0.1 s batches, so near a
+  second boundary "forwarded" can differ from "incoming" by a few percent (totals match; a
+  blocked source is always exactly 0). Above 10 pkt/s the dot density is a log scale; the
+  exact value is the number on the box. The diagram shows at most five attacker boxes;
+  traffic of the others counts in the gateway total but has no dots. At about 6500 pkt/s
+  the scapy sniffer itself starts to lose a few packets (under 1 %), with or without the
+  live view.
 - **No automated test suite for the pipeline.** The tests above are manual command
   sequences; only the dashboard has unit tests.
 - **Tested only on Docker Desktop for Windows.** Other Docker hosts may behave differently.
@@ -363,6 +411,8 @@ templates as designed. The fix sets `api_version="v1beta"` on the Gemini client.
   unblocked independently
 - Read-only web dashboard on `127.0.0.1:8080`: lab diagram with host status, event list,
   explanations and opinions, active blocks computed from the log
+- Live traffic in the dashboard: per-second sensor summary over SSE, measured pkt/s per
+  attacker and dots that stop at the gateway when the forwarded count is 0
 
 ### Planned
 

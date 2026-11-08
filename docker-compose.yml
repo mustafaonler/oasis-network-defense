@@ -92,6 +92,8 @@ services:
       OASIS_SRC_NET: 10.10.1.0/24
       OASIS_SENSOR_IGNORE: "10.10.1.1,10.10.1.254"
       OASIS_SENSOR_DNS_SERVER: 10.10.1.254   # attackers' DNS (see dns: above)
+      OASIS_LIVE_FILE: data/live.json        # per-second summary for the dashboard (last 10 s)
+      OASIS_LIVE_FWD_IP: 10.10.2.254         # count forwarded packets on the victim side
     depends_on: [gateway]
 
   # Only reads and writes files: no network, no capabilities.
@@ -135,6 +137,7 @@ services:
     environment:
       OASIS_DASH_BIND: 0.0.0.0                            # inside the container only
       OASIS_DASH_HOSTS: "127.0.0.1:8080,localhost:8080"   # Host header allowlist
+      OASIS_LIVE_FILE: data/live.json                     # written by the sensor
     ports:
       - "127.0.0.1:8080:8080"                             # host loopback only
     networks: [dash]

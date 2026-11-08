@@ -6,10 +6,12 @@ the data volume is mounted read-only. Never touches the firewall: the blocklist
 shown here is computed from the event log, not read from nftables.
 Only GET is served; every database string is sent as JSON and shown as plain text.
 """
+import ipaddress
 import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,6 +28,16 @@ ALARM_WINDOW = 300     # seconds: a recent attack event marks a host as "alarm"
 ACTIVE_WINDOW = 3600   # seconds: attackers with an event this recent appear in the diagram
 EVENT_LIMIT = 200      # newest events in the list
 ATTACK_ACTIONS = ("block", "skip_already_blocked", "skip_whitelist", "log_only", "block_failed")
+
+# Live traffic: per-second summary written by the sensor (OASIS_LIVE_FILE there).
+LIVE_FILE = os.environ.get("OASIS_LIVE_FILE", "data/live.json")
+LIVE_STALE = 3           # seconds: older data means the sensor is not writing
+LIVE_MAX_BYTES = 512 * 1024
+LIVE_MAX_SECONDS = 10
+LIVE_MAX_SOURCES = 64
+LIVE_POLL = 0.25         # how often a stream checks the file
+SSE_MAX = 4              # concurrent live streams (each holds one server thread)
+LIVE_COUNTERS = ("pkts", "syn", "ports", "fwd")
 
 STATIC = {             # exact paths only: no file system lookups from the URL
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -194,6 +206,48 @@ def read_state(path=DB_FILE):
         return empty_state(now, f"Veritabanı okunamadı: {e}")
 
 
+def count(v):
+    """A non-negative integer from the live file, or None."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+def read_live(path=LIVE_FILE, now=None):
+    """Sanitized live summary: only valid IPs and non-negative integer counters pass."""
+    now = time.time() if now is None else now
+    try:
+        if os.path.getsize(path) > LIVE_MAX_BYTES:
+            return {"ok": False, "stale": True, "error": "live file too large", "seconds": []}
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        return {"ok": False, "stale": True, "error": "no live data", "seconds": []}
+    if not isinstance(raw, dict):
+        return {"ok": False, "stale": True, "error": "bad live data", "seconds": []}
+    updated = raw.get("updated")
+    if not isinstance(updated, (int, float)) or isinstance(updated, bool):
+        return {"ok": False, "stale": True, "error": "bad live data", "seconds": []}
+    seconds = []
+    for sec in (raw.get("seconds") or [])[-LIVE_MAX_SECONDS:]:
+        if not isinstance(sec, dict) or not isinstance(sec.get("t"), int):
+            continue
+        sources = {}
+        items = sec.get("sources") if isinstance(sec.get("sources"), dict) else {}
+        for ip, c in list(items.items())[:LIVE_MAX_SOURCES]:
+            try:
+                ip = str(ipaddress.ip_address(ip))
+            except ValueError:
+                continue
+            if not isinstance(c, dict):
+                continue
+            vals = {k: count(c.get(k)) for k in LIVE_COUNTERS}
+            if None in vals.values():
+                continue
+            sources[ip] = vals
+        seconds.append({"t": sec["t"], "sources": sources})
+    return {"ok": True, "stale": now - updated > LIVE_STALE, "error": None,
+            "now": now, "updated": updated, "seconds": seconds}
+
+
 def load_static():
     files = {}
     for route, (name, ctype) in STATIC.items():
@@ -207,7 +261,9 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
     static = {}
     db_path = DB_FILE
+    live_path = LIVE_FILE
     allowed_hosts = ALLOWED_HOSTS
+    sse_slots = threading.BoundedSemaphore(SSE_MAX)
 
     def send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
         self.send_response(code)
@@ -220,10 +276,46 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def stream_live(self):
+        """Server-Sent Events: push the live summary when the sensor rewrites it.
+
+        Also sends at least once a second, so the browser notices a stopped sensor.
+        """
+        self.close_connection = True
+        self.send_response(200)
+        for k, v in SECURITY_HEADERS.items():
+            self.send_header(k, v)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.end_headers()
+        last_mtime, last_sent = None, 0.0
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            while True:
+                try:
+                    mtime = os.stat(self.live_path).st_mtime_ns
+                except OSError:
+                    mtime = None
+                now = time.time()
+                if mtime != last_mtime or now - last_sent >= 1:
+                    data = json.dumps(read_live(self.live_path, now), ensure_ascii=False)
+                    self.wfile.write(f"data: {data}\n\n".encode())
+                    self.wfile.flush()
+                    last_mtime, last_sent = mtime, now
+                time.sleep(LIVE_POLL)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return   # browser closed the stream
+
     def do_GET(self):
         if self.headers.get("Host", "") not in self.allowed_hosts:
             return self.send(403, b"forbidden host\n")
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/live":
+            if not self.sse_slots.acquire(blocking=False):
+                return self.send(503, b"too many live streams\n", extra={"Retry-After": "5"})
+            try:
+                return self.stream_live()
+            finally:
+                self.sse_slots.release()
         if path == "/api/state":
             body = json.dumps(read_state(self.db_path), ensure_ascii=False).encode()
             return self.send(200, body, "application/json; charset=utf-8")
@@ -243,16 +335,19 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
 
 
-def make_server(bind=BIND, port=PORT, db_path=DB_FILE, allowed_hosts=None):
+def make_server(bind=BIND, port=PORT, db_path=DB_FILE, allowed_hosts=None, live_path=LIVE_FILE):
     handler = type("BoundHandler", (Handler,), {
-        "static": load_static(), "db_path": db_path,
+        "static": load_static(), "db_path": db_path, "live_path": live_path,
+        "sse_slots": threading.BoundedSemaphore(SSE_MAX),
         "allowed_hosts": set(allowed_hosts) if allowed_hosts else ALLOWED_HOSTS})
-    return ThreadingHTTPServer((bind, port), handler)
+    srv = ThreadingHTTPServer((bind, port), handler)
+    srv.daemon_threads = True   # open live streams never block shutdown
+    return srv
 
 
 def main():
     srv = make_server()
-    print(f"Dashboard on {BIND}:{PORT} (read-only, db={DB_FILE}). "
+    print(f"Dashboard on {BIND}:{PORT} (read-only, db={DB_FILE}, live={LIVE_FILE}). "
           f"Allowed hosts: {', '.join(sorted(ALLOWED_HOSTS))}", flush=True)
     srv.serve_forever()
 
