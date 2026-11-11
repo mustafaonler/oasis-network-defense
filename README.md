@@ -321,6 +321,31 @@ process and competed with the scapy sniffer for the GIL. Under the flood it miss
 of forwarded packets and the 5-second windows lost up to 5.5 %. It now runs as a child
 process that sends its counts ten times a second.
 
+### Measurement: time to stop a SYN flood
+
+Method: a limited SYN flood (`hping3 -S -p 80 -c 5000 -i u1000`, about 1000 SYN/s) from an
+attacker with no block in the last hour, three runs with three different attackers. All
+containers share the host kernel clock, so the timestamps are comparable.
+
+- **T0**: first SYN from the attacker seen on the gateway's victim-side interface
+  (`tcpdump -tt` on `eth1`), i.e. the first packet that reached the victim.
+- **T1**: last SYN from the attacker seen there. After the block nothing more is forwarded.
+- **Tresp**: the responder's event time for the block (`events.epoch`, taken just before
+  the `nft` command), as a cross-check.
+- A run counts only if fewer than 5000 SYN reached the victim, i.e. the block came while
+  the flood was still running.
+
+| Run | SYN that reached the victim | T1 − T0 (first SYN → stopped) | T1 − Tresp |
+|---|---|---|---|
+| 1 | 4318 / 5000 | 5.305 s | 0.006 s |
+| 2 | 1929 / 5000 | 2.373 s | 0.006 s |
+| 3 | 3127 / 5000 | 4.086 s | 0.006 s |
+
+**Min 2.37 s, max 5.31 s, mean 3.92 s.** The spread comes from where the flood starts inside
+the sensor's 5-second window: the alert is raised only when that window closes, plus the
+detector and responder poll their input files every 0.5 s. Once the responder decides,
+the gateway stops forwarding within about 6 ms.
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -329,7 +354,8 @@ process that sends its counts ten times a second.
 - **A fast attack can finish before the block.** Alerts come only when a 5-second window
   closes, and the responder acts after that. A fast scan can be over before its window ends
   (in testing, nmap probed 30 ports in 0.1 s and the block came about 4 s later). The block
-  then stops the attacker's next step, not the scan that triggered it.
+  then stops the attacker's next step, not the scan that triggered it. A SYN flood was
+  stopped 2.4–5.3 s after its first packet (see "Measurement: time to stop a SYN flood").
 - **Per-source rules miss distributed scans.** Each source IP is judged on its own. Three
   attackers that each probe 10 ports (30 in total) raise no alert, because none of them
   reaches the 20-port threshold (Stage D, test D5).
