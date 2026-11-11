@@ -6,22 +6,24 @@ Pipeline: alert -> whitelist -> risk level -> action ladder
 """
 import ipaddress
 import json
+import os
 import sqlite3
 import subprocess
 import sys
 import time
 
+from policy import LADDER, REPEAT_WINDOW, START_STEP
+
 ALERTS_FILE = "data/alerts.jsonl"
 DB_FILE = "data/oasis.db"
 
 # Never block these: gateway, victim, management network.
-WHITELIST = [ipaddress.ip_network(n) for n in
-             ("10.0.1.1/32", "10.0.2.1/32", "10.0.2.10/32", "192.168.56.0/24")]
+# OASIS_WHITELIST (comma-separated addresses or networks) overrides the VM list.
+WHITELIST = [ipaddress.ip_network(n.strip()) for n in os.environ.get(
+    "OASIS_WHITELIST", "10.0.1.1/32,10.0.2.1/32,10.0.2.10/32,192.168.56.0/24").split(",")
+    if n.strip()]
 
 RISK = {"port_scan": "medium", "syn_flood": "high"}
-START_STEP = {"medium": 0, "high": 1}
-LADDER = [300, 1800, None]   # seconds; None = until removed manually
-REPEAT_WINDOW = 3600         # seconds: a repeat offender escalates
 
 blocked_until = {}           # ip -> unix time (inf = manual)
 

@@ -14,6 +14,8 @@ import sqlite3
 import sys
 import time
 
+import policy
+
 DB_FILE = "data/oasis.db"
 WINDOW_SECONDS = 5
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
@@ -39,7 +41,8 @@ COMMON = (
     "write them as percent values, for example 99.0 percent. risk_opinion: use "
     "raise only if current_risk is medium and the evidence is far stronger than "
     "the rule needs; never use raise when current_risk is high; use lower only "
-    "if the evidence is weak."
+    "if the evidence is weak. repeat_rule shows how often this source was already "
+    "blocked in the last hour (prior_blocks_last_hour); you may use it for risk_opinion."
 )
 FOCUS = {
     "port_scan": (
@@ -89,20 +92,24 @@ def open_db():
 
 def pending(db):
     return db.execute(
-        "SELECT id, ts, attack_type, evidence, risk FROM events WHERE action='block' "
+        "SELECT id, ts, attack_type, evidence, risk, source_ip, mode, epoch, duration_s "
+        "FROM events WHERE action='block' "
         "AND id NOT IN (SELECT event_id FROM analyses) ORDER BY id").fetchall()
 
 
-def build_payload(atype, ev, risk="medium"):
+def build_payload(atype, ev, risk="medium", repeat=None):
     e = {k: ev.get(k) for k in NUM_KEYS}
     pk, syn = e["packet_count"] or 0, e["syn_count"] or 0
     derived = {  # computed in code, so the LLM never does arithmetic
         "syn_share_percent": round(100 * syn / pk, 1) if pk else 0,
         "unique_ports_per_second": round((e["unique_ports"] or 0) / WINDOW_SECONDS, 1),
     }
-    return {"attack_type": atype, "current_risk": risk, "evidence": e,
-            "derived": derived, "rule_threshold": THRESHOLDS.get(atype, {}),
-            "lab_baseline": LAB_BASELINE, "window_seconds": WINDOW_SECONDS}
+    p = {"attack_type": atype, "current_risk": risk, "evidence": e,
+         "derived": derived, "rule_threshold": THRESHOLDS.get(atype, {}),
+         "lab_baseline": LAB_BASELINE, "window_seconds": WINDOW_SECONDS}
+    if repeat is not None:
+        p["repeat_rule"] = repeat
+    return p
 
 
 def collect(o, out):
@@ -142,8 +149,9 @@ def call_llm(provider, model, system, payload):
     if provider == "gemini":
         from google import genai
         from google.genai import types
+        # v1beta: on the v1 API (google-genai 3.x default) some models reject system_instruction.
         client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
-                              http_options=types.HttpOptions(timeout=20000))
+                              http_options=types.HttpOptions(timeout=20000, api_version="v1beta"))
         r = client.models.generate_content(
             model=model, contents=json.dumps(payload),
             config=types.GenerateContentConfig(
@@ -189,12 +197,12 @@ def rule_opinion(atype, p):
             "risk_opinion": "keep", "reasons": [why]}
 
 
-def analyze(atype, ev, mock, risk="medium"):
+def analyze(atype, ev, mock, risk="medium", repeat=None):
     """Router: pick the specialist for this attack type, return its opinion."""
     if atype not in AGENTS:
         return None
     agent = AGENTS[atype]
-    p = build_payload(atype, ev, risk)
+    p = build_payload(atype, ev, risk, repeat)
     provider = None if mock else pick_provider()
     if provider is None:
         return agent, "rules", rule_opinion(atype, p)
@@ -212,8 +220,10 @@ def analyze(atype, ev, mock, risk="medium"):
 
 
 def run_once(db, mock):
-    for _id, ts, atype, ev, risk in pending(db):
-        res = analyze(atype, json.loads(ev) if ev else {}, mock, risk or "medium")
+    for _id, ts, atype, ev, risk, ip, mode, epoch, dur in pending(db):
+        # ip is used for the local repeat count only; it never goes into the payload.
+        repeat = policy.repeat_rule(db, ip, mode, epoch, risk, dur)
+        res = analyze(atype, json.loads(ev) if ev else {}, mock, risk or "medium", repeat)
         if res is None:
             continue
         agent, label, op = res

@@ -12,6 +12,8 @@ import sqlite3
 import sys
 import time
 
+import policy
+
 DB_FILE = "data/oasis.db"
 MODELS = {"gemini": os.environ.get("OASIS_MODEL", "gemini-2.5-flash"),
           "anthropic": os.environ.get("OASIS_MODEL", "claude-haiku-5-5")}
@@ -24,6 +26,9 @@ SYSTEM = (
     "You receive one event as JSON with numeric fields only. Explain in Turkish, "
     "in 3-4 short sentences, why the traffic was classified as this attack "
     "and why this block duration was chosen. Use ONLY the numbers given. "
+    "The duration comes from repeat_rule: the risk level sets start_step_for_risk, "
+    "and each prior_blocks_last_hour moves the source one step up ladder_seconds "
+    "(applied_step is the result). Give that reason for the duration. "
     "Do not invent facts, do not give commands, do not suggest actions."
 )
 
@@ -48,17 +53,21 @@ def open_db():
 def pending(db):
     return db.execute(
         "SELECT id, ts, source_ip, attack_type, risk, action, duration_s, mode, "
-        "evidence FROM events WHERE action='block' AND id NOT IN "
+        "evidence, epoch FROM events WHERE action='block' AND id NOT IN "
         "(SELECT event_id FROM explanations) ORDER BY id").fetchall()
 
 
-def build_payload(row):
-    _id, ts, ip, atype, risk, action, dur, mode, ev = row
+def build_payload(row, repeat=None):
+    # ip is read for the local repeat count only; it never goes into the payload.
+    _id, ts, ip, atype, risk, action, dur, mode, ev = row[:9]
     ev = json.loads(ev) if ev else {}
-    return {"attack_type": atype, "risk": risk, "action": action, "mode": mode,
-            "block_duration_seconds": dur if dur else "until_manual_unblock",
-            "evidence": {k: ev.get(k) for k in NUM_KEYS},
-            "rule_threshold": THRESHOLDS.get(atype, {})}
+    p = {"attack_type": atype, "risk": risk, "action": action, "mode": mode,
+         "block_duration_seconds": dur if dur else "until_manual_unblock",
+         "evidence": {k: ev.get(k) for k in NUM_KEYS},
+         "rule_threshold": THRESHOLDS.get(atype, {})}
+    if repeat is not None:
+        p["repeat_rule"] = repeat
+    return p
 
 
 def template_text(p):
@@ -75,14 +84,25 @@ def template_text(p):
         why = "Kural eşiği aşıldı."
     d = p["block_duration_seconds"]
     dur = "elle kaldırılana kadar" if d == "until_manual_unblock" else f"{d // 60} dakika"
-    return f"{why} Risk seviyesi {p['risk']}, kaynak {dur} engellendi."
+    r = p.get("repeat_rule")
+    if r is None:
+        return f"{why} Risk seviyesi {p['risk']}, kaynak {dur} engellendi."
+    if r["prior_blocks_last_hour"] == 0:
+        step = (f"Kaynak son 1 saatte engellenmemişti, bu yüzden risk seviyesinin "
+                f"başlangıç basamağı ({r['start_step_for_risk']}) uygulandı.")
+    else:
+        step = (f"Kaynak son 1 saatte {r['prior_blocks_last_hour']} kez daha engellendiği "
+                f"için başlangıç basamağı {r['start_step_for_risk']} yerine "
+                f"{r['applied_step']} uygulandı.")
+    return f"{why} Risk seviyesi {p['risk']}. {step} Kaynak {dur} engellendi."
 
 
 def llm_text_gemini(p, model):
     from google import genai
     from google.genai import types
+    # v1beta: on the v1 API (google-genai 3.x default) some models reject system_instruction.
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
-                         http_options=types.HttpOptions(timeout=20000))
+                         http_options=types.HttpOptions(timeout=20000, api_version="v1beta"))
     r = client.models.generate_content(
         model=model, contents=json.dumps(p),
         config=types.GenerateContentConfig(
@@ -126,6 +146,15 @@ def allowed_numbers(p):
     if isinstance(d, (int, float)):
         nums.add(float(d))
         nums.add(d / 60)
+    r = p.get("repeat_rule")
+    if r:
+        for k in ("prior_blocks_last_hour", "start_step_for_risk", "applied_step"):
+            nums.update((float(r[k]), float(r[k] + 1)))   # 0-based or 1-based step
+        for s in r["ladder_seconds"]:
+            if isinstance(s, (int, float)):
+                nums.update((float(s), s / 60))
+        w = r["repeat_window_seconds"]
+        nums.update((float(w), w / 60, w / 3600))          # seconds, minutes, hours
     return nums
 
 
@@ -158,7 +187,8 @@ def explain(p, mock):
 
 def run_once(db, mock):
     for row in pending(db):
-        p = build_payload(row)
+        repeat = policy.repeat_rule(db, row[2], row[7], row[9], row[4], row[6])
+        p = build_payload(row, repeat)
         model, text = explain(p, mock)
         db.execute("INSERT INTO explanations VALUES (?,?,?,?)",
                    (row[0], time.strftime("%Y-%m-%dT%H:%M:%S"), model, text))

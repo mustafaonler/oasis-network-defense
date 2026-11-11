@@ -1,0 +1,9 @@
+# Lab isolation: the gateway only forwards between the two lab subnets.
+# Separate table so OASIS (responder.py) never touches it.
+table inet lab_isolation {
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        meta nfproto ipv6 drop
+        ip daddr != { 10.10.1.0/24, 10.10.2.0/24 } drop
+    }
+}

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """OASIS detector v1: rule-based Port Scan and SYN Flood detection."""
 import json
+import os
 import sys
 import time
 
@@ -8,7 +9,9 @@ WINDOWS_FILE = "data/windows.jsonl"
 ALERTS_FILE = "data/alerts.jsonl"
 PORT_SCAN_MIN_PORTS = 20      # distinct SYN ports in one window
 SYN_FLOOD_MIN_RATE = 50       # SYN per second from one source
-WHITELIST = {"10.0.1.1"}      # sources that never raise alerts
+# Sources that never raise alerts; OASIS_WHITELIST (comma-separated) overrides.
+WHITELIST = {h.strip() for h in os.environ.get("OASIS_WHITELIST", "10.0.1.1").split(",")
+             if h.strip()}
 
 
 def check(rec):

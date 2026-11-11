@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OASIS Panel</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>OASIS Panel</h1>
+    <p class="sub">Salt okunur izleme · veriler <code>oasis.db</code> olay kayıtlarından</p>
+  </div>
+  <div class="statuses">
+    <p id="status" class="status" role="status">Yükleniyor…</p>
+    <p id="live-status" class="status stale">Canlı akış: bağlanıyor…</p>
+  </div>
+</header>
+
+<main>
+  <p id="error" class="error" hidden></p>
+
+  <section class="cards" aria-label="Özet">
+    <div class="card"><span class="num" id="c-active">–</span><span class="lbl">Aktif engel</span></div>
+    <div class="card"><span class="num" id="c-hour">–</span><span class="lbl">Son 1 saatte engelleme</span></div>
+    <div class="card"><span class="num" id="c-total">–</span><span class="lbl">Toplam olay</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>Lab şeması</h2>
+    <div class="diagram-wrap"><svg id="diagram" viewBox="0 0 940 380" role="img"
+      aria-label="Lab konteynerleri ve durumları"></svg></div>
+    <ul class="legend">
+      <li><span class="dot normal"></span>normal</li>
+      <li><span class="dot alarm"></span>alarm (son <span id="alarm-min">5</span> dk içinde saldırı olayı)</li>
+      <li><span class="dot blocked"></span>engelli</li>
+      <li><span class="dot pkt"></span>ölçülen paket (gateway'den geçti)</li>
+      <li><span class="dot drop"></span>gateway'de kaldı (iletilmedi)</li>
+    </ul>
+    <p class="note">Durumlar Docker'dan değil, olay kayıtlarından hesaplanır. Saldırganlar:
+      son 1 saatte olayı olan, hâlâ engelli olan veya son 10 sn'de trafik gönderen IP'ler.</p>
+    <p class="note">Canlı akış sensörün saniyelik ölçümünden gelir: ölçülen her saniye için
+      10 pkt/s'ye kadar 1 nokta = 1 paket, üstünde logaritmik ölçek. Kesin değer kutudaki pkt/s.
+      Victim'e geçen noktaların oranı, gateway'in victim tarafında ölçülen iletilen paket
+      oranıdır. Yanıt paketleri gösterilmez.</p>
+  </section>
+
+  <section class="panel">
+    <h2>Şu an engelli IP'ler</h2>
+    <p class="note">Gateway'e sorulmadan olay kayıtlarından hesaplanır
+      (son engelleme − sonraki manuel kaldırma − süresi dolanlar).</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>IP</th><th>Olay türü</th><th>Başlangıç</th><th>Süre</th><th>Kalan</th></tr></thead>
+        <tbody id="blocked"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Olaylar</h2>
+    <p class="note">Ayrıntı için bir satıra tıklayın. En yeni olay en üstte.</p>
+    <div class="events-grid">
+      <div class="table-wrap">
+        <table class="events">
+          <thead><tr><th>#</th><th>Zaman</th><th>Kaynak IP</th><th>Tür</th><th>Risk</th><th>Aksiyon</th><th>Engel süresi</th></tr></thead>
+          <tbody id="events"></tbody>
+        </table>
+      </div>
+      <aside id="detail" class="detail" aria-live="polite">
+        <p class="muted">Bir olay seçin.</p>
+      </aside>
+    </div>
+  </section>
+</main>
+</body>
+</html>
