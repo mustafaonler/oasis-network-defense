@@ -235,10 +235,11 @@ If you publish the dashboard on another host port, change `OASIS_DASH_HOSTS` to 
 Unit tests (run inside the images, no Python needed on the host):
 
 ```bash
-docker compose build dashboard sensor
+docker compose build dashboard sensor explainer
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/dashboard:dev python3 -m unittest discover -s tests -p test_dashboard.py -v
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_sensor.py -v
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_detector.py -v
+docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/agents:dev python3 -m unittest discover -s tests -p test_retry.py -v
 ```
 
 ## Test results
@@ -428,6 +429,24 @@ Two runs back to back with `bash scripts/scenario.sh`, both exit code 0:
 
 The LLM fallbacks were Gemini HTTP 5xx errors on that day; the blocks did not depend on them.
 
+### LLM retry on transient errors
+
+`src/retry.py`, used by both agents: after an HTTP 5xx, a timeout or a dropped connection
+the call is tried once more after 2 s. Client errors (400, 401, 404, 429), bad JSON and
+numbers missing from the evidence are not retried. A result that needed the retry is
+labelled `(verified) [retry]`; a failed retry is marked in the fallback (`tekrar denendi`,
+`retried`).
+
+| # | Test | Result |
+|---|---|---|
+| U5 | 12 unit tests with fake LLM calls: first try, 5xx then success, 5xx twice, 400/401/404/429 not retried, Anthropic 529 and timeouts retried, bad JSON not retried; labels and fallback texts of both agents | Pass |
+| R1 | Payloads and template texts of all 41 stored block events identical to the previous commit | Pass |
+| L1 | Live: a model name that does not exist (HTTP 404) falls back at once, no retry, 0.4–0.5 s per call | Pass |
+| L2 | Live: third scenario run, 9 / 9 PASS. LLM: 8 of 10 calls verified (one of them after the retry), 2 fallbacks after a failed retry. The two runs before the retry: 7 / 10 and 4 / 10 | Pass |
+
+The retry helps but is not a cure: when Gemini is overloaded, a second try 2 s later can
+fail too. A longer delay or a second retry would trade more of these for slower fallbacks.
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -474,7 +493,9 @@ The LLM fallbacks were Gemini HTTP 5xx errors on that day; the blocks did not de
 - **LLM dependence.** Explanations are advisory and may be generic. Provider outages
   (such as HTTP 503) fall back to templates. On 2026-11-25 Gemini returned many HTTP 5xx
   errors: when three events arrived at once, all six calls fell back (the blocks were not
-  affected, and the same calls were verified on retry). There is no automatic retry yet. `gemini-2.5-flash`, the code's default Gemini
+  affected, and the same calls were verified on retry). The agents now retry once after a
+  5xx (see "LLM retry on transient errors"), which recovers some of these but not all.
+  `gemini-2.5-flash`, the code's default Gemini
   model, is deprecated by Google (earliest shutdown 1 December 2026). Set `OASIS_MODEL`
   to a current model. `OASIS_MODEL` is shared by both providers, so change or remove it
   when switching providers.
@@ -539,13 +560,13 @@ The LLM fallbacks were Gemini HTTP 5xx errors on that day; the blocks did not de
 - Distributed scan rule: per-target windows from the sensor (`OASIS_TARGET_FILE`), every
   source that took part is blocked, a normal user on the same target is not;
   `DistributedScanAgent` for the specialist
+- One LLM retry after HTTP 5xx / timeouts (`src/retry.py`), with `[retry]` in the label
 - Scenario script (`scripts/scenario.sh`): normal user plus a staged attack chain with IP
   hopping, checked phase by phase, PASS/FAIL report; `user` service in a compose profile
 
 ### Planned
 
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
-- Retry an LLM call once after an HTTP 5xx before falling back to the template
 - Longer sliding window per target, to catch scans spread over several windows
 - MITM / ARP spoofing detection
 - Further README and documentation edits

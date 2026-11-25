@@ -13,6 +13,7 @@ import sys
 import time
 
 import policy
+from retry import call_with_retry
 
 DB_FILE = "data/oasis.db"
 MODELS = {"gemini": os.environ.get("OASIS_MODEL", "gemini-2.5-flash"),
@@ -195,13 +196,15 @@ def explain(p, mock):
     model = MODELS[provider]
     try:
         fn = llm_text_gemini if provider == "gemini" else llm_text_anthropic
-        text = fn(p, model).replace("`", "").replace("**", "")
+        raw, retried = call_with_retry(fn, p, model)   # one retry on HTTP 5xx / timeout
+        text = raw.replace("`", "").replace("**", "")
     except Exception as e:
-        return "mock(fallback)", template_text(p) + f" [LLM hatasi: {type(e).__name__}]"
+        again = ", tekrar denendi" if getattr(e, "oasis_retried", False) else ""
+        return "mock(fallback)", template_text(p) + f" [LLM hatasi: {type(e).__name__}{again}]"
     bad = verify(text, p)
     if bad:
         return "mock(fallback)", template_text(p) + " [Dogrulama basarisiz, kanitta olmayan sayilar: " + ", ".join(bad) + "]"
-    return f"{provider}:{model} (verified)", text
+    return f"{provider}:{model} (verified)" + (" [retry]" if retried else ""), text
 
 
 def run_once(db, mock):

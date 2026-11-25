@@ -15,6 +15,7 @@ import sys
 import time
 
 import policy
+from retry import call_with_retry
 
 DB_FILE = "data/oasis.db"
 WINDOW_SECONDS = 5
@@ -237,15 +238,18 @@ def analyze(atype, ev, mock, risk="medium", repeat=None):
         return agent, "rules", rule_opinion(atype, p)
     model = model_for(provider)
     try:
-        op = parse_opinion(call_llm(provider, model, COMMON + " " + FOCUS[atype], p))
+        # one retry on HTTP 5xx / timeout; bad JSON or invented numbers are not retried
+        raw, retried = call_with_retry(call_llm, provider, model, COMMON + " " + FOCUS[atype], p)
+        op = parse_opinion(raw)
         bad = unbacked(op["reasons"], p)
         if bad:
             raise ValueError("numbers not in evidence: " + ",".join(bad))
         if risk == "high" and op["risk_opinion"] == "raise":
             op["risk_opinion"] = "keep"   # already at the top level
-        return agent, f"{provider}:{model} (verified)", op
+        return agent, f"{provider}:{model} (verified)" + (" [retry]" if retried else ""), op
     except Exception as ex:
-        return agent, f"rules(fallback:{type(ex).__name__})", rule_opinion(atype, p)
+        again = ",retried" if getattr(ex, "oasis_retried", False) else ""
+        return agent, f"rules(fallback:{type(ex).__name__}{again})", rule_opinion(atype, p)
 
 
 def run_once(db, mock):
