@@ -81,6 +81,23 @@ services:
     networks: [attacker-net]
     depends_on: [gateway]
 
+  # Scenario only (docker compose --profile scenario): a normal user browsing the victim.
+  # Same image as the attacker, but only NET_ADMIN (for its route), no raw sockets, and
+  # not whitelisted: it has to pass the same rules as everyone else.
+  user:
+    image: oasis/attacker:dev
+    pull_policy: never   # local image only, never a same-named image from a registry
+    profiles: [scenario]
+    init: true
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN]
+    environment:
+      OASIS_GW: 10.10.1.254
+    dns: [10.10.1.254]
+    networks: [attacker-net]
+    depends_on: [gateway]
+    command: ["sh", "-c", "while true; do curl -s -o /dev/null --max-time 2 http://10.10.2.10/; sleep $$(shuf -i 1-3 -n 1); done"]
+
   # Sniffs the gateway's attacker-side interface (found from OASIS_GW_IP).
   sensor:
     <<: *core

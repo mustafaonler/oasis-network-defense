@@ -168,6 +168,33 @@ docker compose up -d --scale attacker=1
 
 Stop the lab with `docker compose down`. To also delete the event database, add `-v`.
 
+### Scenario
+
+One command runs a staged attack chain while a normal user browses, checks every phase
+against the event log and prints a PASS/FAIL report (about 2.5 minutes):
+
+```bash
+bash scripts/scenario.sh
+```
+
+| Phase | What happens | Expected |
+|---|---|---|
+| 0 | A normal user (`user` service) curls the victim every 1–3 s for 30 s | no alert |
+| 1 | Attacker a1: quick recon, 15 ports | no alert |
+| 2 | a1: full scan, 100 ports | `port_scan`, a1 blocked |
+| 3 | The attacker hops to a new IP (a2) and sends one quiet SYN to 3389 | `tripwire`, a2 blocked |
+| 4 | Two more IPs (a3, a4) split a scan, 10 ports each, no tripwire port | `distributed_scan`, a3 and a4 blocked |
+| 5 | The admin unblocks a1, which starts a SYN flood (3000 SYN) | `syn_flood`, a1 blocked again |
+| all | The normal user | never blamed, still gets HTTP 200 |
+
+The `user` service only exists in the `scenario` compose profile, so a normal
+`docker compose up` never starts it. It uses the attacker image (local only,
+`pull_policy: never`) with `NET_ADMIN` for its route and no raw sockets, and it is not
+whitelisted. The script checks block types, not durations: those depend on each IP's
+blocks in the last hour. LLM results are reported for information only. The script never
+starts Docker; if the daemon is down it says so and exits with code 2. At the end it
+removes every block, stops the user and goes back to one attacker.
+
 ### Dashboard
 
 Open <http://127.0.0.1:8080> on the Docker host. The page refreshes every 5 seconds and shows:
@@ -390,6 +417,17 @@ Only counts reach the LLM; the target IP stays in the database.
 | R3 | Agents: all six live calls fell back on Gemini HTTP 5xx; retried, the specialist and (on the second try) the explainer returned `(verified)` with the right reason for the duration | Pass |
 | R4 | Dashboard lists the three `distributed_scan` events | Pass |
 
+### Scenario runs
+
+Two runs back to back with `bash scripts/scenario.sh`, both exit code 0:
+
+| Run | Checks | Time | Block durations seen | LLM (explainer / specialist verified of 5) |
+|---|---|---|---|---|
+| 1 | 9 / 9 PASS | 2 min 26 s | 5 min to manual (IPs already had blocks that day) | 5 / 2 |
+| 2 | 9 / 9 PASS | 2 min 21 s | mostly manual (more prior blocks) | 2 / 2 |
+
+The LLM fallbacks were Gemini HTTP 5xx errors on that day; the blocks did not depend on them.
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -501,13 +539,15 @@ Only counts reach the LLM; the target IP stays in the database.
 - Distributed scan rule: per-target windows from the sensor (`OASIS_TARGET_FILE`), every
   source that took part is blocked, a normal user on the same target is not;
   `DistributedScanAgent` for the specialist
+- Scenario script (`scripts/scenario.sh`): normal user plus a staged attack chain with IP
+  hopping, checked phase by phase, PASS/FAIL report; `user` service in a compose profile
 
 ### Planned
 
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
 - Retry an LLM call once after an HTTP 5xx before falling back to the template
 - Longer sliding window per target, to catch scans spread over several windows
-- Scenario script: normal user traffic plus a staged attack chain, with a PASS/FAIL report
+- MITM / ARP spoofing detection
 - Further README and documentation edits
 
 ## AI assistance
