@@ -19,10 +19,13 @@ MODELS = {"gemini": os.environ.get("OASIS_MODEL", "gemini-2.5-flash"),
           "anthropic": os.environ.get("OASIS_MODEL", "claude-haiku-5-5")}
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
-OPTIONAL_KEYS = ("tripwire_hits",)   # only in windows from a sensor with tripwire ports
+# Present only for some events (tripwire sensor, distributed rule); missing ones are left out.
+OPTIONAL_KEYS = ("tripwire_hits", "target_unique_ports", "distributed_sources")
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
               "syn_flood": {"min_syn_per_second": 50},
-              "tripwire": {"min_tripwire_hits": 1}}
+              "tripwire": {"min_tripwire_hits": 1},
+              "distributed_scan": {"min_target_unique_ports": 20, "min_sources": 2,
+                                   "min_ports_per_source": 3}}
 SYSTEM = (
     "You are a SOC assistant inside an autonomous network defense system. "
     "You receive one event as JSON with numeric fields only. Explain in Turkish, "
@@ -32,6 +35,9 @@ SYSTEM = (
     "and each prior_blocks_last_hour moves the source one step up ladder_seconds "
     "(applied_step is the result). Give that reason for the duration. "
     "tripwire_hits counts connection attempts to ports where no lab service runs. "
+    "For distributed_scan, target_unique_ports is the number of distinct ports of one "
+    "target probed by distributed_sources sources together, and unique_ports is this "
+    "source's share. "
     "Do not invent facts, do not give commands, do not suggest actions."
 )
 
@@ -64,8 +70,7 @@ def build_payload(row, repeat=None):
     # ip is read for the local repeat count only; it never goes into the payload.
     _id, ts, ip, atype, risk, action, dur, mode, ev = row[:9]
     ev = json.loads(ev) if ev else {}
-    evidence = {k: ev.get(k) for k in NUM_KEYS}
-    evidence.update({k: ev[k] for k in OPTIONAL_KEYS if k in ev})
+    evidence = {k: ev[k] for k in NUM_KEYS + OPTIONAL_KEYS if ev.get(k) is not None}
     p = {"attack_type": atype, "risk": risk, "action": action, "mode": mode,
          "block_duration_seconds": dur if dur else "until_manual_unblock",
          "evidence": evidence,
@@ -89,6 +94,11 @@ def template_text(p):
         why = (f"Tek bir 5 saniyelik pencerede tuzak portlara {e.get('tripwire_hits')} "
                f"bağlantı denemesi yapıldı (eşik {t.get('min_tripwire_hits')}). Bu portlarda "
                "laboratuvarda hiçbir servis çalışmadığı için deneme yoklama sayıldı.")
+    elif p["attack_type"] == "distributed_scan":
+        why = (f"Tek bir 5 saniyelik pencerede {e.get('distributed_sources')} kaynak aynı hedefin "
+               f"toplam {e.get('target_unique_ports')} farklı portunu yokladı (eşik "
+               f"{t.get('min_target_unique_ports')}); bu kaynağın payı {e.get('unique_ports')} port. "
+               "Tarama kaynaklara bölündüğü için tek tek eşiğin altında kalsa da dağıtık tarama sayıldı.")
     else:
         why = "Kural eşiği aşıldı."
     d = p["block_duration_seconds"]

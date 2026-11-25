@@ -36,8 +36,8 @@ The working VM version stays on `main` and is tagged **`demo-v2`**.
 
 | Component | Role | Talks to the LLM? | Touches the firewall? |
 |---|---|---|---|
-| `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, a per-second live summary for the dashboard) | No | No |
-| `detector.py` | Rules, first match wins: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood`; ≥ 1 SYN to a tripwire port (Docker lab: 21, 23, 445, 3389) → `tripwire` | No | No |
+| `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, per-target summaries for the distributed rule and a per-second live summary for the dashboard) | No | No |
+| `detector.py` | Per-source rules, first match wins: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood`; ≥ 1 SYN to a tripwire port (Docker lab: 21, 23, 445, 3389) → `tripwire`. Per-target rule: ≥ 20 ports of one target from ≥ 2 sources with ≥ 3 ports each, none of them ≥ 20 alone → `distributed_scan` for each of those sources | No | No |
 | `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log | No | **Yes** |
 | `explainer.py` | Explains each block in Turkish (3–4 sentences), number-verified | Yes (numbers only) | No |
 | `specialist.py` | Router picks `PortScanAgent` or `SynFloodAgent` for a second opinion (JSON) | Yes (numbers only) | No |
@@ -369,6 +369,27 @@ a tripwire port keeps the more telling name. Without the variable (VM) nothing c
 | R3 | Agents on tripwire events: 4 of 6 results `(verified)` live, 2 fell back to templates on Gemini HTTP 5xx; both retried and came back `(verified)` | Pass |
 | R4 | Dashboard lists the tripwire events | Pass |
 
+### Distributed scans
+
+With `OASIS_TARGET_FILE` set, the sensor also writes, for every target that at least two
+sources sent SYNs to in a window, how many distinct ports each source probed. The detector
+raises `distributed_scan` (risk medium) for every source with ≥ 3 ports when together they
+probed ≥ 20 ports of that target and none of them reached 20 alone (that one is already a
+`port_scan`). The 3-port floor keeps a normal user who only touched port 80 out of it.
+Only counts reach the LLM; the target IP stays in the database.
+
+| # | Test | Result |
+|---|---|---|
+| U4 | Unit tests: per-target counts (only SYNs, per source), source windows unchanged, no collection in the VM (3); rule cases DS1–DS4, single contributor, whitelist (7) | Pass |
+| R1 | VM settings: sensor, detector and responder identical to the previous commit; payloads and template texts of all 27 stored block events unchanged | Pass |
+| DS1 | Three attackers probe 30–39, 40–49 and 50–59 at once (10 ports each) | target record: 4 sources, 31 ports; `distributed_scan` and a block for each of the three |
+| DS2 | A fourth container browses (`curl` every second) during DS1 | not blamed (1 port), 15/15 requests answered, never blocked |
+| DS3 | Two attackers, 5 ports each (10 in total) | no alert |
+| DS4 | One attacker probes 30 ports while another probes 5 | only `port_scan` for the first; no `distributed_scan`, the second is not blamed |
+| R2 | LLM payloads: only counts (`target_unique_ports`, `distributed_sources`, this source's ports); no source or target IP, no free text | Pass |
+| R3 | Agents: all six live calls fell back on Gemini HTTP 5xx; retried, the specialist and (on the second try) the explainer returned `(verified)` with the right reason for the duration | Pass |
+| R4 | Dashboard lists the three `distributed_scan` events | Pass |
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -379,11 +400,12 @@ a tripwire port keeps the more telling name. Without the variable (VM) nothing c
   (in testing, nmap probed 30 ports in 0.1 s and the block came about 4 s later). The block
   then stops the attacker's next step, not the scan that triggered it. A SYN flood was
   stopped 2.4–5.3 s after its first packet (see "Measurement: time to stop a SYN flood").
-- **Per-source rules miss distributed scans.** Each source IP is judged on its own. Three
-  attackers that each probe 10 ports (30 in total) raise no alert, because none of them
-  reaches the 20-port threshold (Stage D, test D5). Tripwire ports now catch every source
-  that touches one of them, even on its first packet (IP hopping, test T3), but a split
-  scan that avoids those ports is still missed.
+- **Distributed scans: covered within one window only.** The per-source rules alone missed
+  three attackers that each probed 10 ports (Stage D, test D5). The distributed rule now
+  catches that case (test DS1), and tripwire ports catch any source that touches them
+  (test T3). Still missed: a scan spread over several windows (for example 5 ports every
+  10 s from changing IPs), a scan split into pieces of fewer than 3 ports per source, and
+  scans spread over many targets. A longer sliding window per target would narrow this.
 - **Tripwire limits.** It only covers the four listed ports, so an attacker who skips them
   is not caught by this rule. Detection still waits for the 5-second window (0–5 s). A
   misconfigured client that tries one of these ports gets a 5-minute block; the specialist
@@ -412,7 +434,9 @@ a tripwire port keeps the more telling name. Without the variable (VM) nothing c
 - **Secrets are environment variables.** Anyone who can run `docker inspect` on the agent
   containers can read the key.
 - **LLM dependence.** Explanations are advisory and may be generic. Provider outages
-  (such as HTTP 503) fall back to templates. `gemini-2.5-flash`, the code's default Gemini
+  (such as HTTP 503) fall back to templates. On 2026-11-25 Gemini returned many HTTP 5xx
+  errors: when three events arrived at once, all six calls fell back (the blocks were not
+  affected, and the same calls were verified on retry). There is no automatic retry yet. `gemini-2.5-flash`, the code's default Gemini
   model, is deprecated by Google (earliest shutdown 1 December 2026). Set `OASIS_MODEL`
   to a current model. `OASIS_MODEL` is shared by both providers, so change or remove it
   when switching providers.
@@ -474,11 +498,15 @@ a tripwire port keeps the more telling name. Without the variable (VM) nothing c
   attacker and dots that stop at the gateway when the forwarded count is 0
 - Tripwire ports (21, 23, 445, 3389): one probe is enough, so a source that changes its IP
   is caught again on its first packet; `TripwireAgent` for the specialist; detector unit tests
+- Distributed scan rule: per-target windows from the sensor (`OASIS_TARGET_FILE`), every
+  source that took part is blocked, a normal user on the same target is not;
+  `DistributedScanAgent` for the specialist
 
 ### Planned
 
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
-- Detection across sources (distributed scans), for example per-target port counts
+- Retry an LLM call once after an HTTP 5xx before falling back to the template
+- Longer sliding window per target, to catch scans spread over several windows
 - Scenario script: normal user traffic plus a staged attack chain, with a PASS/FAIL report
 - Further README and documentation edits
 

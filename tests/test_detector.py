@@ -55,5 +55,48 @@ class Rules(unittest.TestCase):
         self.assertIn("tripwire", alert["reason"])
 
 
+def target(per_source):
+    ports = sum(n for n in per_source.values())          # disjoint port ranges in these tests
+    return {"window_start": "t0", "window_end": "t1", "dst_ip": "10.0.2.10",
+            "sources": len(per_source), "target_unique_ports": ports,
+            "target_syn_count": ports,
+            "per_source": {ip: {"ports": n, "syn": n} for ip, n in per_source.items()}}
+
+
+def blamed(rec):
+    return sorted(a["source_ip"] for a in detector.check_target(rec))
+
+
+class Distributed(unittest.TestCase):
+    def test_vm_rule_off(self):
+        self.assertIsNone(detector.TARGETS_FILE)
+
+    def test_three_sources_ten_ports_each(self):                         # D1
+        rec = target({"10.0.1.65": 10, "10.0.1.66": 10, "10.0.1.67": 10})
+        self.assertEqual(blamed(rec), ["10.0.1.65", "10.0.1.66", "10.0.1.67"])
+        a = detector.check_target(rec)[0]
+        self.assertEqual(a["attack_type"], "distributed_scan")
+        self.assertEqual(a["evidence"]["target_unique_ports"], 30)
+        self.assertEqual(a["evidence"]["distributed_sources"], 3)
+        self.assertEqual(a["evidence"]["unique_ports"], 10)
+
+    def test_normal_user_not_blamed(self):                               # D2
+        rec = target({"10.0.1.65": 10, "10.0.1.66": 10, "10.0.1.70": 1})
+        self.assertEqual(blamed(rec), ["10.0.1.65", "10.0.1.66"])
+
+    def test_below_threshold(self):                                      # D3
+        self.assertEqual(blamed(target({"10.0.1.65": 5, "10.0.1.66": 5})), [])
+
+    def test_single_big_scanner_left_to_port_scan(self):                 # D4
+        self.assertEqual(blamed(target({"10.0.1.65": 30, "10.0.1.66": 5})), [])
+
+    def test_one_contributor_is_not_distributed(self):
+        self.assertEqual(blamed(target({"10.0.1.65": 19, "10.0.1.70": 1})), [])
+
+    def test_whitelisted_source_not_blamed(self):
+        rec = target({"10.0.1.65": 10, "10.0.1.66": 10, "10.0.1.1": 10})
+        self.assertEqual(blamed(rec), ["10.0.1.65", "10.0.1.66"])
+
+
 if __name__ == "__main__":
     unittest.main()

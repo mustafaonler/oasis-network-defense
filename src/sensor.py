@@ -41,6 +41,12 @@ def parse_ports(text):
 _tw = os.environ.get("OASIS_TRIPWIRE_PORTS")
 TRIPWIRE_PORTS = parse_ports(_tw) if _tw else None
 
+# Per-target view for distributed scans: for every destination, which sources sent SYNs
+# to how many distinct ports in the window. Written only for targets that at least two
+# sources touched (the only case the distributed rule looks at). Unset (VM): off.
+TARGET_FILE = os.environ.get("OASIS_TARGET_FILE") or None
+TARGET_MIN_SOURCES = 2
+
 # Live view (dashboard only, never used for detection). Unset (VM): nothing changes.
 # OASIS_LIVE_FILE: per-second, per-source counts of the last LIVE_KEEP seconds,
 # rewritten atomically every second, so the file never grows.
@@ -76,6 +82,13 @@ def new_stats():
 
 
 stats = defaultdict(new_stats)
+
+
+def new_target():
+    return defaultdict(lambda: {"ports": set(), "syn": 0})   # source -> its SYNs to this target
+
+
+targets = defaultdict(new_target)   # destination -> sources (filled only with TARGET_FILE)
 lock = threading.Lock()
 
 
@@ -112,6 +125,10 @@ def handle(pkt):
                 syn_port = pkt[TCP].dport
                 if TRIPWIRE_PORTS and syn_port in TRIPWIRE_PORTS:
                     st["tripwire_hits"] += 1
+                if TARGET_FILE:
+                    ts = targets[pkt[IP].dst][pkt[IP].src]
+                    ts["ports"].add(syn_port)
+                    ts["syn"] += 1
     if LIVE_FILE:
         with live_lock:
             lv = live[pkt[IP].src]
@@ -217,7 +234,22 @@ def window_record(ip, st, start, end):
     return rec
 
 
-def flusher(out):
+def target_record(dst, per_source, start, end):
+    """One window summary for one destination: who probed how many of its ports."""
+    all_ports = set().union(*(s["ports"] for s in per_source.values()))
+    return {
+        "window_start": datetime.fromtimestamp(start).isoformat(timespec="seconds"),
+        "window_end": datetime.fromtimestamp(end).isoformat(timespec="seconds"),
+        "dst_ip": dst,
+        "sources": len(per_source),
+        "target_unique_ports": len(all_ports),
+        "target_syn_count": sum(s["syn"] for s in per_source.values()),
+        "per_source": {ip: {"ports": len(s["ports"]), "syn": s["syn"]}
+                       for ip, s in per_source.items()},
+    }
+
+
+def flusher(out, tout=None):
     while True:
         start = time.time()
         time.sleep(WINDOW)
@@ -225,12 +257,20 @@ def flusher(out):
         with lock:
             snapshot = dict(stats)
             stats.clear()
+            tsnap = dict(targets)
+            targets.clear()
         for ip, st in snapshot.items():
             rec = window_record(ip, st, start, end)
             line = json.dumps(rec)
             print(line, flush=True)
             out.write(line + "\n")
             out.flush()
+        if tout is None:
+            continue
+        for dst, per_source in tsnap.items():
+            if len(per_source) >= TARGET_MIN_SOURCES:
+                tout.write(json.dumps(target_record(dst, per_source, start, end)) + "\n")
+                tout.flush()
 
 
 def main():
@@ -252,8 +292,12 @@ def main():
             print(f"Forwarded count on {fwd_iface} (child process)", flush=True)
         threading.Thread(target=live_writer, args=(LIVE_FILE,), daemon=True).start()
         print(f"Live summary: {LIVE_FILE} (last {LIVE_KEEP}s, every 1s)", flush=True)
+    tout = open(TARGET_FILE, "a") if TARGET_FILE else None
+    if tout:
+        print(f"Per-target windows: {TARGET_FILE} (targets touched by ≥ {TARGET_MIN_SOURCES} sources)",
+              flush=True)
     with open(OUTFILE, "a") as out:
-        threading.Thread(target=flusher, args=(out,), daemon=True).start()
+        threading.Thread(target=flusher, args=(out, tout), daemon=True).start()
         try:
             sniff(iface=iface, filter=BPF, prn=handle, store=False)
         except KeyboardInterrupt:

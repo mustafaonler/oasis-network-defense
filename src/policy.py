@@ -6,7 +6,10 @@ No firewall code here, so the LLM agents can import it without loading nft logic
 
 # tripwire: one probe of a port with no service is clear intent but thin evidence,
 # so it starts at the lowest step; repeats escalate on the ladder.
-RISK = {"port_scan": "medium", "syn_flood": "high", "tripwire": "medium"}
+# distributed_scan: a coordinated scan, but each source's own evidence is small
+# (3+ ports), so it also starts low and escalates on repeats.
+RISK = {"port_scan": "medium", "syn_flood": "high", "tripwire": "medium",
+        "distributed_scan": "medium"}
 START_STEP = {"medium": 0, "high": 1}
 LADDER = [300, 1800, None]   # seconds; None = until removed manually
 REPEAT_WINDOW = 3600         # seconds: a repeat offender escalates

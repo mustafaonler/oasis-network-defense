@@ -20,17 +20,20 @@ DB_FILE = "data/oasis.db"
 WINDOW_SECONDS = 5
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
-OPTIONAL_KEYS = ("tripwire_hits",)   # only in windows from a sensor with tripwire ports
+# Present only for some events (tripwire sensor, distributed rule); missing ones are left out.
+OPTIONAL_KEYS = ("tripwire_hits", "target_unique_ports", "distributed_sources")
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
               "syn_flood": {"min_syn_per_second": 50},
-              "tripwire": {"min_tripwire_hits": 1}}
+              "tripwire": {"min_tripwire_hits": 1},
+              "distributed_scan": {"min_target_unique_ports": 20, "min_sources": 2,
+                                   "min_ports_per_source": 3}}
 # Numbers measured in our own lab tests (normal web, SSH, small scans).
 LAB_BASELINE = {"normal_traffic_max_syn_per_second": 3.6,
                 "normal_traffic_unique_ports": 1,
                 "small_scan_ports_that_raised_no_alert": 15,
                 "normal_traffic_tripwire_hits": 0}
 AGENTS = {"port_scan": "PortScanAgent", "syn_flood": "SynFloodAgent",
-          "tripwire": "TripwireAgent"}
+          "tripwire": "TripwireAgent", "distributed_scan": "DistributedScanAgent"}
 
 COMMON = (
     "You are a specialist analyst in an autonomous network defense system. "
@@ -66,6 +69,12 @@ FOCUS = {
         "window, how many distinct ports were probed overall, and whether this looks "
         "like a careful low-volume probe or a mistake. Normal traffic never touches "
         "these ports (lab baseline)."),
+    "distributed_scan": (
+        "Your specialty is distributed scans: one target probed by several sources that "
+        "each stay under the single-source threshold. Judge: target_unique_ports versus "
+        "the threshold, how many sources took part (distributed_sources), this source's "
+        "share (unique_ports), and whether the split looks coordinated. Compare with the "
+        "lab baseline: normal traffic touches 1 port."),
 }
 
 
@@ -108,13 +117,12 @@ def pending(db):
 
 
 def build_payload(atype, ev, risk="medium", repeat=None):
-    e = {k: ev.get(k) for k in NUM_KEYS}
-    e.update({k: ev[k] for k in OPTIONAL_KEYS if k in ev})
-    pk, syn = e["packet_count"] or 0, e["syn_count"] or 0
-    derived = {  # computed in code, so the LLM never does arithmetic
-        "syn_share_percent": round(100 * syn / pk, 1) if pk else 0,
-        "unique_ports_per_second": round((e["unique_ports"] or 0) / WINDOW_SECONDS, 1),
-    }
+    e = {k: ev[k] for k in NUM_KEYS + OPTIONAL_KEYS if ev.get(k) is not None}
+    derived = {}   # computed in code, so the LLM never does arithmetic
+    if "packet_count" in e:   # unknown for distributed_scan: no share then, not a fake 0
+        pk, syn = e["packet_count"] or 0, e.get("syn_count") or 0
+        derived["syn_share_percent"] = round(100 * syn / pk, 1) if pk else 0
+    derived["unique_ports_per_second"] = round((e.get("unique_ports") or 0) / WINDOW_SECONDS, 1)
     p = {"attack_type": atype, "current_risk": risk, "evidence": e,
          "derived": derived, "rule_threshold": THRESHOLDS.get(atype, {}),
          "lab_baseline": LAB_BASELINE, "window_seconds": WINDOW_SECONDS}
@@ -206,6 +214,11 @@ def rule_opinion(atype, p):
         hit = hits >= t["min_tripwire_hits"]
         why = (f"Tuzak portlara {hits} bağlantı denemesi görüldü, "
                f"kural eşiği {t['min_tripwire_hits']}.")
+    elif atype == "distributed_scan":
+        total = e.get("target_unique_ports") or 0
+        hit = total >= t["min_target_unique_ports"]
+        why = (f"{e.get('distributed_sources')} kaynak birlikte {total} farklı portu yokladı, "
+               f"bu kaynağın payı {e.get('unique_ports')}; kural eşiği {t['min_target_unique_ports']}.")
     else:
         hit = e["syn_per_second"] >= t["min_syn_per_second"]
         why = f"Saniyede {e['syn_per_second']} SYN görüldü, kural eşiği {t['min_syn_per_second']}."
