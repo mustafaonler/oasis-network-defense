@@ -12,6 +12,8 @@ to explain the decision and give a second opinion.
 This branch (`docker`) moves the project from a set of VMs into Docker containers.
 The working VM version stays on `main` and is tagged **`demo-v2`**.
 
+![OASIS overview: isolated Docker lab, traffic sensing, rule-based detection, decision and enforcement, LLM agents, live dashboard](docs/oasis_infographic.png)
+
 ## Core principle
 
 - **Blocking decisions are made by rules, not by the LLM.** The detector and the
