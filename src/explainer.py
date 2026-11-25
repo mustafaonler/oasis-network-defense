@@ -19,8 +19,10 @@ MODELS = {"gemini": os.environ.get("OASIS_MODEL", "gemini-2.5-flash"),
           "anthropic": os.environ.get("OASIS_MODEL", "claude-haiku-5-5")}
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
+OPTIONAL_KEYS = ("tripwire_hits",)   # only in windows from a sensor with tripwire ports
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
-              "syn_flood": {"min_syn_per_second": 50}}
+              "syn_flood": {"min_syn_per_second": 50},
+              "tripwire": {"min_tripwire_hits": 1}}
 SYSTEM = (
     "You are a SOC assistant inside an autonomous network defense system. "
     "You receive one event as JSON with numeric fields only. Explain in Turkish, "
@@ -29,6 +31,7 @@ SYSTEM = (
     "The duration comes from repeat_rule: the risk level sets start_step_for_risk, "
     "and each prior_blocks_last_hour moves the source one step up ladder_seconds "
     "(applied_step is the result). Give that reason for the duration. "
+    "tripwire_hits counts connection attempts to ports where no lab service runs. "
     "Do not invent facts, do not give commands, do not suggest actions."
 )
 
@@ -61,9 +64,11 @@ def build_payload(row, repeat=None):
     # ip is read for the local repeat count only; it never goes into the payload.
     _id, ts, ip, atype, risk, action, dur, mode, ev = row[:9]
     ev = json.loads(ev) if ev else {}
+    evidence = {k: ev.get(k) for k in NUM_KEYS}
+    evidence.update({k: ev[k] for k in OPTIONAL_KEYS if k in ev})
     p = {"attack_type": atype, "risk": risk, "action": action, "mode": mode,
          "block_duration_seconds": dur if dur else "until_manual_unblock",
-         "evidence": {k: ev.get(k) for k in NUM_KEYS},
+         "evidence": evidence,
          "rule_threshold": THRESHOLDS.get(atype, {})}
     if repeat is not None:
         p["repeat_rule"] = repeat
@@ -80,6 +85,10 @@ def template_text(p):
         why = (f"{e['unique_ports']} porta saniyede {e['syn_per_second']} SYN "
                f"gönderildi (eşik {t.get('min_syn_per_second')} SYN/sn). "
                "Tek porta bu hız SYN Flood belirtisidir.")
+    elif p["attack_type"] == "tripwire":
+        why = (f"Tek bir 5 saniyelik pencerede tuzak portlara {e.get('tripwire_hits')} "
+               f"bağlantı denemesi yapıldı (eşik {t.get('min_tripwire_hits')}). Bu portlarda "
+               "laboratuvarda hiçbir servis çalışmadığı için deneme yoklama sayıldı.")
     else:
         why = "Kural eşiği aşıldı."
     d = p["block_duration_seconds"]

@@ -27,6 +27,20 @@ _dns = os.environ.get("OASIS_SENSOR_DNS_SERVER")
 DNS_SERVER = str(ipaddress.ip_address(_dns)) if _dns else None
 OUTFILE = "data/windows.jsonl"
 
+
+def parse_ports(text):
+    """'21,23' -> {21, 23}; every entry must be a TCP port number."""
+    ports = {int(p) for p in text.split(",") if p.strip()}
+    if not ports or not all(1 <= p <= 65535 for p in ports):
+        sys.exit(f"bad port list: {text!r}")
+    return ports
+
+
+# Tripwire ports: no lab service runs there, so a connection attempt is a probe.
+# SYNs to them are counted as tripwire_hits; unset (VM): no such field.
+_tw = os.environ.get("OASIS_TRIPWIRE_PORTS")
+TRIPWIRE_PORTS = parse_ports(_tw) if _tw else None
+
 # Live view (dashboard only, never used for detection). Unset (VM): nothing changes.
 # OASIS_LIVE_FILE: per-second, per-source counts of the last LIVE_KEEP seconds,
 # rewritten atomically every second, so the file never grows.
@@ -57,7 +71,8 @@ def find_iface():
 
 
 def new_stats():
-    return {"packet_count": 0, "syn_count": 0, "dst_ips": set(), "syn_ports": set()}
+    return {"packet_count": 0, "syn_count": 0, "dst_ips": set(), "syn_ports": set(),
+            "tripwire_hits": 0}
 
 
 stats = defaultdict(new_stats)
@@ -95,6 +110,8 @@ def handle(pkt):
                 st["syn_count"] += 1
                 st["syn_ports"].add(pkt[TCP].dport)
                 syn_port = pkt[TCP].dport
+                if TRIPWIRE_PORTS and syn_port in TRIPWIRE_PORTS:
+                    st["tripwire_hits"] += 1
     if LIVE_FILE:
         with live_lock:
             lv = live[pkt[IP].src]
@@ -183,6 +200,23 @@ def fwd_merger(conn):
                 live[ip]["fwd"] += n
 
 
+def window_record(ip, st, start, end):
+    """One window summary for one source (the detector's input)."""
+    rec = {
+        "window_start": datetime.fromtimestamp(start).isoformat(timespec="seconds"),
+        "window_end": datetime.fromtimestamp(end).isoformat(timespec="seconds"),
+        "source_ip": ip,
+        "packet_count": st["packet_count"],
+        "syn_count": st["syn_count"],
+        "unique_ports": len(st["syn_ports"]),
+        "unique_dst_ips": len(st["dst_ips"]),
+        "syn_per_second": round(st["syn_count"] / WINDOW, 1),
+    }
+    if TRIPWIRE_PORTS:
+        rec["tripwire_hits"] = st["tripwire_hits"]
+    return rec
+
+
 def flusher(out):
     while True:
         start = time.time()
@@ -192,16 +226,7 @@ def flusher(out):
             snapshot = dict(stats)
             stats.clear()
         for ip, st in snapshot.items():
-            rec = {
-                "window_start": datetime.fromtimestamp(start).isoformat(timespec="seconds"),
-                "window_end": datetime.fromtimestamp(end).isoformat(timespec="seconds"),
-                "source_ip": ip,
-                "packet_count": st["packet_count"],
-                "syn_count": st["syn_count"],
-                "unique_ports": len(st["syn_ports"]),
-                "unique_dst_ips": len(st["dst_ips"]),
-                "syn_per_second": round(st["syn_count"] / WINDOW, 1),
-            }
+            rec = window_record(ip, st, start, end)
             line = json.dumps(rec)
             print(line, flush=True)
             out.write(line + "\n")
@@ -212,6 +237,8 @@ def main():
     iface = find_iface()
     print(f"Sensor started on {iface}, window={WINDOW}s. Ctrl+C to stop.", flush=True)
     print(f"BPF: {BPF}", flush=True)
+    if TRIPWIRE_PORTS:
+        print(f"Tripwire ports: {sorted(TRIPWIRE_PORTS)}", flush=True)
     if LIVE_FILE:
         if LIVE_FWD_IP:
             # fork before any thread starts

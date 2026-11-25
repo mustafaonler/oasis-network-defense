@@ -37,7 +37,7 @@ The working VM version stays on `main` and is tagged **`demo-v2`**.
 | Component | Role | Talks to the LLM? | Touches the firewall? |
 |---|---|---|---|
 | `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, a per-second live summary for the dashboard) | No | No |
-| `detector.py` | Rules: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood` | No | No |
+| `detector.py` | Rules, first match wins: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood`; ≥ 1 SYN to a tripwire port (Docker lab: 21, 23, 445, 3389) → `tripwire` | No | No |
 | `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log | No | **Yes** |
 | `explainer.py` | Explains each block in Turkish (3–4 sentences), number-verified | Yes (numbers only) | No |
 | `specialist.py` | Router picks `PortScanAgent` or `SynFloodAgent` for a second opinion (JSON) | Yes (numbers only) | No |
@@ -211,6 +211,7 @@ Unit tests (run inside the images, no Python needed on the host):
 docker compose build dashboard sensor
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/dashboard:dev python3 -m unittest discover -s tests -p test_dashboard.py -v
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_sensor.py -v
+docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_detector.py -v
 ```
 
 ## Test results
@@ -348,6 +349,26 @@ the sensor's 5-second window: the alert is raised only when that window closes, 
 detector and responder poll their input files every 0.5 s. Once the responder decides,
 the gateway stops forwarding within about 6 ms.
 
+### Tripwire ports
+
+No lab service runs on 21, 23, 445 or 3389 (`OASIS_TRIPWIRE_PORTS`), so a single connection
+attempt there is treated as a probe: risk medium, 5-minute block, escalating on repeats.
+Rule order: `port_scan` and `syn_flood` are checked first, so a big scan that also touches
+a tripwire port keeps the more telling name. Without the variable (VM) nothing changes.
+
+| # | Test | Result |
+|---|---|---|
+| U3 | Unit tests: sensor counts only SYNs to tripwire ports, other window fields unchanged, no field in the VM, bad port lists rejected (4); detector rule order, whitelist, VM windows without the field (8) | Pass |
+| R1 | VM settings: sensor statistics and BPF, detector decisions for 6 windows, and the responder dry-run scenario (VM and Docker whitelist) identical to the previous commit | Pass |
+| T1 | Normal use: 30 `curl` requests in 60 s, 15 windows with at most 1 port and 0.4 SYN/s, `tripwire_hits` 0 | Pass, no alert |
+| T2 | One SYN to port 23 | `tripwire`, block 5 min, ping lost |
+| T3 | IP hopping: three attackers each send one SYN to 3389 | every new IP blocked on its first packet (the already blocked one: `skip_already_blocked`) |
+| T4 | 15-port scan without tripwire ports | no alert (unchanged) |
+| T5 | 30-port scan that includes 21 and 23 (`tripwire_hits` 2) | reported as `port_scan`, not `tripwire` |
+| R2 | LLM payloads of tripwire events: only counts (`tripwire_hits` added), no IP, no free text | Pass |
+| R3 | Agents on tripwire events: 4 of 6 results `(verified)` live, 2 fell back to templates on Gemini HTTP 5xx; both retried and came back `(verified)` | Pass |
+| R4 | Dashboard lists the tripwire events | Pass |
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -360,12 +381,18 @@ the gateway stops forwarding within about 6 ms.
   stopped 2.4–5.3 s after its first packet (see "Measurement: time to stop a SYN flood").
 - **Per-source rules miss distributed scans.** Each source IP is judged on its own. Three
   attackers that each probe 10 ports (30 in total) raise no alert, because none of them
-  reaches the 20-port threshold (Stage D, test D5).
+  reaches the 20-port threshold (Stage D, test D5). Tripwire ports now catch every source
+  that touches one of them, even on its first packet (IP hopping, test T3), but a split
+  scan that avoids those ports is still missed.
+- **Tripwire limits.** It only covers the four listed ports, so an attacker who skips them
+  is not caught by this rule. Detection still waits for the 5-second window (0–5 s). A
+  misconfigured client that tries one of these ports gets a 5-minute block; the specialist
+  tends to suggest `lower` for a single probe, which is advisory only.
 - **Recycled lab IPs keep their history.** Docker hands a freed address to the next
   attacker container, so a new container can inherit an old IP's recent blocks and get a
   longer block on its first scan.
-- **Only two attack types** (port scan, SYN flood). There is no detection for UDP floods,
-  application-layer attacks, brute force and similar attacks.
+- **Only three detection rules** (port scan, SYN flood, tripwire). There is no detection
+  for UDP floods, application-layer attacks, brute force and similar attacks.
 - **One direction only.** The sensor watches traffic from `attacker-net`. Traffic that
   starts on the victim side is not analyzed. The lab is IPv4 only; IPv6 is dropped.
 - **Small blind spot from the DNS fix.** In the Docker lab, packets to the gateway on
@@ -445,12 +472,14 @@ the gateway stops forwarding within about 6 ms.
   explanations and opinions, active blocks computed from the log
 - Live traffic in the dashboard: per-second sensor summary over SSE, measured pkt/s per
   attacker and dots that stop at the gateway when the forwarded count is 0
+- Tripwire ports (21, 23, 445, 3389): one probe is enough, so a source that changes its IP
+  is caught again on its first packet; `TripwireAgent` for the specialist; detector unit tests
 
 ### Planned
 
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
 - Detection across sources (distributed scans), for example per-target port counts
-- Automated tests for the detection rules and the action ladder
+- Scenario script: normal user traffic plus a staged attack chain, with a PASS/FAIL report
 - Further README and documentation edits
 
 ## AI assistance

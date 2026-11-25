@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 
-from policy import LADDER, REPEAT_WINDOW, START_STEP
+from policy import LADDER, REPEAT_WINDOW, RISK, START_STEP
 
 ALERTS_FILE = "data/alerts.jsonl"
 DB_FILE = "data/oasis.db"
@@ -22,8 +22,6 @@ DB_FILE = "data/oasis.db"
 WHITELIST = [ipaddress.ip_network(n.strip()) for n in os.environ.get(
     "OASIS_WHITELIST", "10.0.1.1/32,10.0.2.1/32,10.0.2.10/32,192.168.56.0/24").split(",")
     if n.strip()]
-
-RISK = {"port_scan": "medium", "syn_flood": "high"}
 
 blocked_until = {}           # ip -> unix time (inf = manual)
 

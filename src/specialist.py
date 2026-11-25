@@ -20,13 +20,17 @@ DB_FILE = "data/oasis.db"
 WINDOW_SECONDS = 5
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
+OPTIONAL_KEYS = ("tripwire_hits",)   # only in windows from a sensor with tripwire ports
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
-              "syn_flood": {"min_syn_per_second": 50}}
+              "syn_flood": {"min_syn_per_second": 50},
+              "tripwire": {"min_tripwire_hits": 1}}
 # Numbers measured in our own lab tests (normal web, SSH, small scans).
 LAB_BASELINE = {"normal_traffic_max_syn_per_second": 3.6,
                 "normal_traffic_unique_ports": 1,
-                "small_scan_ports_that_raised_no_alert": 15}
-AGENTS = {"port_scan": "PortScanAgent", "syn_flood": "SynFloodAgent"}
+                "small_scan_ports_that_raised_no_alert": 15,
+                "normal_traffic_tripwire_hits": 0}
+AGENTS = {"port_scan": "PortScanAgent", "syn_flood": "SynFloodAgent",
+          "tripwire": "TripwireAgent"}
 
 COMMON = (
     "You are a specialist analyst in an autonomous network defense system. "
@@ -56,6 +60,12 @@ FOCUS = {
         "versus the rule threshold and versus the maximum seen in normal traffic, "
         "concentration on a single port, the share of SYN among all packets, and "
         "whether a legitimate traffic burst could explain it."),
+    "tripwire": (
+        "Your specialty is tripwire probes: connection attempts to ports where no lab "
+        "service runs (tripwire_hits). Judge: how many tripwire attempts came in one "
+        "window, how many distinct ports were probed overall, and whether this looks "
+        "like a careful low-volume probe or a mistake. Normal traffic never touches "
+        "these ports (lab baseline)."),
 }
 
 
@@ -99,6 +109,7 @@ def pending(db):
 
 def build_payload(atype, ev, risk="medium", repeat=None):
     e = {k: ev.get(k) for k in NUM_KEYS}
+    e.update({k: ev[k] for k in OPTIONAL_KEYS if k in ev})
     pk, syn = e["packet_count"] or 0, e["syn_count"] or 0
     derived = {  # computed in code, so the LLM never does arithmetic
         "syn_share_percent": round(100 * syn / pk, 1) if pk else 0,
@@ -190,6 +201,11 @@ def rule_opinion(atype, p):
     if atype == "port_scan":
         hit = e["unique_ports"] >= t["min_unique_ports"]
         why = f"{e['unique_ports']} farklı port görüldü, kural eşiği {t['min_unique_ports']}."
+    elif atype == "tripwire":
+        hits = e.get("tripwire_hits") or 0
+        hit = hits >= t["min_tripwire_hits"]
+        why = (f"Tuzak portlara {hits} bağlantı denemesi görüldü, "
+               f"kural eşiği {t['min_tripwire_hits']}.")
     else:
         hit = e["syn_per_second"] >= t["min_syn_per_second"]
         why = f"Saniyede {e['syn_per_second']} SYN görüldü, kural eşiği {t['min_syn_per_second']}."

@@ -118,5 +118,56 @@ class LiveCounts(unittest.TestCase):
             self.assertLess(abs(sizes[-1] - sizes[20]), 16)          # stops growing
 
 
+def tripwire_packets():
+    src = "10.0.1.5"
+    return [IP(src=src, dst="10.0.2.10") / TCP(dport=23, flags="S"),       # probe
+            IP(src=src, dst="10.0.2.10") / TCP(dport=3389, flags="S"),     # probe
+            IP(src=src, dst="10.0.2.10") / TCP(dport=23, flags="SA"),      # not a SYN
+            IP(src=src, dst="10.0.2.10") / UDP(dport=23),                  # not TCP
+            IP(src=src, dst="10.0.2.10") / TCP(dport=80, flags="S")]       # normal port
+
+
+class Tripwire(unittest.TestCase):
+    def setUp(self):
+        sensor.stats.clear()
+        self.saved = sensor.TRIPWIRE_PORTS
+
+    def tearDown(self):
+        sensor.TRIPWIRE_PORTS = self.saved
+        sensor.stats.clear()
+
+    def record(self):
+        return sensor.window_record("10.0.1.5", sensor.stats["10.0.1.5"], 0, 5)
+
+    def test_vm_has_no_tripwire_field(self):
+        self.assertIsNone(sensor.TRIPWIRE_PORTS)
+        for p in tripwire_packets():
+            sensor.handle(p)
+        self.assertNotIn("tripwire_hits", self.record())
+
+    def test_counts_only_syn_to_tripwire_ports(self):
+        sensor.TRIPWIRE_PORTS = {21, 23, 445, 3389}
+        for p in tripwire_packets():
+            sensor.handle(p)
+        rec = self.record()
+        self.assertEqual(rec["tripwire_hits"], 2)
+        self.assertEqual(rec["unique_ports"], 3)        # 23, 3389, 80: other fields unchanged
+
+    def test_other_fields_same_with_and_without_tripwire(self):
+        for p in packets():
+            sensor.handle(p)
+        off = window_stats()
+        sensor.stats.clear()
+        sensor.TRIPWIRE_PORTS = {21, 23, 445, 3389}
+        for p in packets():
+            sensor.handle(p)
+        self.assertEqual(window_stats(), off)
+
+    def test_bad_port_list_rejected(self):
+        for bad in ("0", "70000", "23,abc", ""):
+            with self.assertRaises((SystemExit, ValueError)):
+                sensor.parse_ports(bad)
+
+
 if __name__ == "__main__":
     unittest.main()
