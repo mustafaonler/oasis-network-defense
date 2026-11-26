@@ -12,18 +12,38 @@ import sqlite3
 import sys
 import time
 
+import policy
+from retry import call_with_retry
+
 DB_FILE = "data/oasis.db"
 MODELS = {"gemini": os.environ.get("OASIS_MODEL", "gemini-2.5-flash"),
           "anthropic": os.environ.get("OASIS_MODEL", "claude-haiku-5-5")}
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
+# Present only for some events (tripwire sensor, distributed rule); missing ones are left out.
+OPTIONAL_KEYS = ("tripwire_hits", "target_unique_ports", "distributed_sources",
+                 "gw_impersonation", "binding_conflicts", "arp_claimed_ips")
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
-              "syn_flood": {"min_syn_per_second": 50}}
+              "syn_flood": {"min_syn_per_second": 50},
+              "tripwire": {"min_tripwire_hits": 1},
+              "distributed_scan": {"min_target_unique_ports": 20, "min_sources": 2,
+                                   "min_ports_per_source": 3},
+              "arp_spoof": {"min_forged_arp_claims": 1}}
 SYSTEM = (
     "You are a SOC assistant inside an autonomous network defense system. "
     "You receive one event as JSON with numeric fields only. Explain in Turkish, "
     "in 3-4 short sentences, why the traffic was classified as this attack "
     "and why this block duration was chosen. Use ONLY the numbers given. "
+    "The duration comes from repeat_rule: the risk level sets start_step_for_risk, "
+    "and each prior_blocks_last_hour moves the source one step up ladder_seconds "
+    "(applied_step is the result). Give that reason for the duration. "
+    "tripwire_hits counts connection attempts to ports where no lab service runs. "
+    "For distributed_scan, target_unique_ports is the number of distinct ports of one "
+    "target probed by distributed_sources sources together, and unique_ports is this "
+    "source's share. "
+    "For arp_spoof (a man-in-the-middle attempt), gw_impersonation counts forged ARP "
+    "claims of the gateway's address, binding_conflicts counts claims of an address "
+    "another host was using, and arp_claimed_ips is how many addresses were claimed. "
     "Do not invent facts, do not give commands, do not suggest actions."
 )
 
@@ -48,17 +68,22 @@ def open_db():
 def pending(db):
     return db.execute(
         "SELECT id, ts, source_ip, attack_type, risk, action, duration_s, mode, "
-        "evidence FROM events WHERE action='block' AND id NOT IN "
+        "evidence, epoch FROM events WHERE action='block' AND id NOT IN "
         "(SELECT event_id FROM explanations) ORDER BY id").fetchall()
 
 
-def build_payload(row):
-    _id, ts, ip, atype, risk, action, dur, mode, ev = row
+def build_payload(row, repeat=None):
+    # ip is read for the local repeat count only; it never goes into the payload.
+    _id, ts, ip, atype, risk, action, dur, mode, ev = row[:9]
     ev = json.loads(ev) if ev else {}
-    return {"attack_type": atype, "risk": risk, "action": action, "mode": mode,
-            "block_duration_seconds": dur if dur else "until_manual_unblock",
-            "evidence": {k: ev.get(k) for k in NUM_KEYS},
-            "rule_threshold": THRESHOLDS.get(atype, {})}
+    evidence = {k: ev[k] for k in NUM_KEYS + OPTIONAL_KEYS if ev.get(k) is not None}
+    p = {"attack_type": atype, "risk": risk, "action": action, "mode": mode,
+         "block_duration_seconds": dur if dur else "until_manual_unblock",
+         "evidence": evidence,
+         "rule_threshold": THRESHOLDS.get(atype, {})}
+    if repeat is not None:
+        p["repeat_rule"] = repeat
+    return p
 
 
 def template_text(p):
@@ -71,18 +96,43 @@ def template_text(p):
         why = (f"{e['unique_ports']} porta saniyede {e['syn_per_second']} SYN "
                f"gönderildi (eşik {t.get('min_syn_per_second')} SYN/sn). "
                "Tek porta bu hız SYN Flood belirtisidir.")
+    elif p["attack_type"] == "tripwire":
+        why = (f"Tek bir 5 saniyelik pencerede tuzak portlara {e.get('tripwire_hits')} "
+               f"bağlantı denemesi yapıldı (eşik {t.get('min_tripwire_hits')}). Bu portlarda "
+               "laboratuvarda hiçbir servis çalışmadığı için deneme yoklama sayıldı.")
+    elif p["attack_type"] == "distributed_scan":
+        why = (f"Tek bir 5 saniyelik pencerede {e.get('distributed_sources')} kaynak aynı hedefin "
+               f"toplam {e.get('target_unique_ports')} farklı portunu yokladı (eşik "
+               f"{t.get('min_target_unique_ports')}); bu kaynağın payı {e.get('unique_ports')} port. "
+               "Tarama kaynaklara bölündüğü için tek tek eşiğin altında kalsa da dağıtık tarama sayıldı.")
+    elif p["attack_type"] == "arp_spoof":
+        why = (f"Tek bir 5 saniyelik pencerede sahte ARP mesajları görüldü: gateway adresini "
+               f"sahiplenme {e.get('gw_impersonation')}, başka bir cihazın adresini sahiplenme "
+               f"{e.get('binding_conflicts')} (eşik {t.get('min_forged_arp_claims')}). Bu, trafiği "
+               "araya girerek okumaya yönelik bir ortadaki adam (MITM) girişimidir.")
     else:
         why = "Kural eşiği aşıldı."
     d = p["block_duration_seconds"]
     dur = "elle kaldırılana kadar" if d == "until_manual_unblock" else f"{d // 60} dakika"
-    return f"{why} Risk seviyesi {p['risk']}, kaynak {dur} engellendi."
+    r = p.get("repeat_rule")
+    if r is None:
+        return f"{why} Risk seviyesi {p['risk']}, kaynak {dur} engellendi."
+    if r["prior_blocks_last_hour"] == 0:
+        step = (f"Kaynak son 1 saatte engellenmemişti, bu yüzden risk seviyesinin "
+                f"başlangıç basamağı ({r['start_step_for_risk']}) uygulandı.")
+    else:
+        step = (f"Kaynak son 1 saatte {r['prior_blocks_last_hour']} kez daha engellendiği "
+                f"için başlangıç basamağı {r['start_step_for_risk']} yerine "
+                f"{r['applied_step']} uygulandı.")
+    return f"{why} Risk seviyesi {p['risk']}. {step} Kaynak {dur} engellendi."
 
 
 def llm_text_gemini(p, model):
     from google import genai
     from google.genai import types
+    # v1beta: on the v1 API (google-genai 3.x default) some models reject system_instruction.
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
-                         http_options=types.HttpOptions(timeout=20000))
+                         http_options=types.HttpOptions(timeout=20000, api_version="v1beta"))
     r = client.models.generate_content(
         model=model, contents=json.dumps(p),
         config=types.GenerateContentConfig(
@@ -126,6 +176,15 @@ def allowed_numbers(p):
     if isinstance(d, (int, float)):
         nums.add(float(d))
         nums.add(d / 60)
+    r = p.get("repeat_rule")
+    if r:
+        for k in ("prior_blocks_last_hour", "start_step_for_risk", "applied_step"):
+            nums.update((float(r[k]), float(r[k] + 1)))   # 0-based or 1-based step
+        for s in r["ladder_seconds"]:
+            if isinstance(s, (int, float)):
+                nums.update((float(s), s / 60))
+        w = r["repeat_window_seconds"]
+        nums.update((float(w), w / 60, w / 3600))          # seconds, minutes, hours
     return nums
 
 
@@ -147,18 +206,21 @@ def explain(p, mock):
     model = MODELS[provider]
     try:
         fn = llm_text_gemini if provider == "gemini" else llm_text_anthropic
-        text = fn(p, model).replace("`", "").replace("**", "")
+        raw, retried = call_with_retry(fn, p, model)   # one retry on HTTP 5xx / timeout
+        text = raw.replace("`", "").replace("**", "")
     except Exception as e:
-        return "mock(fallback)", template_text(p) + f" [LLM hatasi: {type(e).__name__}]"
+        again = ", tekrar denendi" if getattr(e, "oasis_retried", False) else ""
+        return "mock(fallback)", template_text(p) + f" [LLM hatasi: {type(e).__name__}{again}]"
     bad = verify(text, p)
     if bad:
         return "mock(fallback)", template_text(p) + " [Dogrulama basarisiz, kanitta olmayan sayilar: " + ", ".join(bad) + "]"
-    return f"{provider}:{model} (verified)", text
+    return f"{provider}:{model} (verified)" + (" [retry]" if retried else ""), text
 
 
 def run_once(db, mock):
     for row in pending(db):
-        p = build_payload(row)
+        repeat = policy.repeat_rule(db, row[2], row[7], row[9], row[4], row[6])
+        p = build_payload(row, repeat)
         model, text = explain(p, mock)
         db.execute("INSERT INTO explanations VALUES (?,?,?,?)",
                    (row[0], time.strftime("%Y-%m-%dT%H:%M:%S"), model, text))

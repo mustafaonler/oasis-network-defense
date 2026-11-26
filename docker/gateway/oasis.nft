@@ -1,0 +1,11 @@
+# OASIS firewall: same layout responder.py ensure_firewall() creates.
+table inet oasis {
+    set blocklist {
+        type ipv4_addr
+        flags timeout
+    }
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        ip saddr @blocklist drop
+    }
+}

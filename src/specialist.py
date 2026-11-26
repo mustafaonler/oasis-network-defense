@@ -14,17 +14,31 @@ import sqlite3
 import sys
 import time
 
+import policy
+from retry import call_with_retry
+
 DB_FILE = "data/oasis.db"
 WINDOW_SECONDS = 5
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
+# Present only for some events (tripwire sensor, distributed rule); missing ones are left out.
+OPTIONAL_KEYS = ("tripwire_hits", "target_unique_ports", "distributed_sources",
+                 "gw_impersonation", "binding_conflicts", "arp_claimed_ips")
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
-              "syn_flood": {"min_syn_per_second": 50}}
+              "syn_flood": {"min_syn_per_second": 50},
+              "tripwire": {"min_tripwire_hits": 1},
+              "distributed_scan": {"min_target_unique_ports": 20, "min_sources": 2,
+                                   "min_ports_per_source": 3},
+              "arp_spoof": {"min_forged_arp_claims": 1}}
 # Numbers measured in our own lab tests (normal web, SSH, small scans).
 LAB_BASELINE = {"normal_traffic_max_syn_per_second": 3.6,
                 "normal_traffic_unique_ports": 1,
-                "small_scan_ports_that_raised_no_alert": 15}
-AGENTS = {"port_scan": "PortScanAgent", "syn_flood": "SynFloodAgent"}
+                "small_scan_ports_that_raised_no_alert": 15,
+                "normal_traffic_tripwire_hits": 0,
+                "normal_traffic_forged_arp_claims": 0}
+AGENTS = {"port_scan": "PortScanAgent", "syn_flood": "SynFloodAgent",
+          "tripwire": "TripwireAgent", "distributed_scan": "DistributedScanAgent",
+          "arp_spoof": "ArpSpoofAgent"}
 
 COMMON = (
     "You are a specialist analyst in an autonomous network defense system. "
@@ -39,7 +53,8 @@ COMMON = (
     "write them as percent values, for example 99.0 percent. risk_opinion: use "
     "raise only if current_risk is medium and the evidence is far stronger than "
     "the rule needs; never use raise when current_risk is high; use lower only "
-    "if the evidence is weak."
+    "if the evidence is weak. repeat_rule shows how often this source was already "
+    "blocked in the last hour (prior_blocks_last_hour); you may use it for risk_opinion."
 )
 FOCUS = {
     "port_scan": (
@@ -53,6 +68,24 @@ FOCUS = {
         "versus the rule threshold and versus the maximum seen in normal traffic, "
         "concentration on a single port, the share of SYN among all packets, and "
         "whether a legitimate traffic burst could explain it."),
+    "tripwire": (
+        "Your specialty is tripwire probes: connection attempts to ports where no lab "
+        "service runs (tripwire_hits). Judge: how many tripwire attempts came in one "
+        "window, how many distinct ports were probed overall, and whether this looks "
+        "like a careful low-volume probe or a mistake. Normal traffic never touches "
+        "these ports (lab baseline)."),
+    "distributed_scan": (
+        "Your specialty is distributed scans: one target probed by several sources that "
+        "each stay under the single-source threshold. Judge: target_unique_ports versus "
+        "the threshold, how many sources took part (distributed_sources), this source's "
+        "share (unique_ports), and whether the split looks coordinated. Compare with the "
+        "lab baseline: normal traffic touches 1 port."),
+    "arp_spoof": (
+        "Your specialty is ARP spoofing (man-in-the-middle). Judge: gw_impersonation "
+        "(forged claims of the gateway's address), binding_conflicts (claims of an address "
+        "another host was using), arp_claimed_ips, and whether this looks like a deliberate "
+        "interception attempt or a misconfiguration. Normal hosts send no forged ARP "
+        "(lab baseline)."),
 }
 
 
@@ -89,20 +122,25 @@ def open_db():
 
 def pending(db):
     return db.execute(
-        "SELECT id, ts, attack_type, evidence, risk FROM events WHERE action='block' "
+        "SELECT id, ts, attack_type, evidence, risk, source_ip, mode, epoch, duration_s "
+        "FROM events WHERE action='block' "
         "AND id NOT IN (SELECT event_id FROM analyses) ORDER BY id").fetchall()
 
 
-def build_payload(atype, ev, risk="medium"):
-    e = {k: ev.get(k) for k in NUM_KEYS}
-    pk, syn = e["packet_count"] or 0, e["syn_count"] or 0
-    derived = {  # computed in code, so the LLM never does arithmetic
-        "syn_share_percent": round(100 * syn / pk, 1) if pk else 0,
-        "unique_ports_per_second": round((e["unique_ports"] or 0) / WINDOW_SECONDS, 1),
-    }
-    return {"attack_type": atype, "current_risk": risk, "evidence": e,
-            "derived": derived, "rule_threshold": THRESHOLDS.get(atype, {}),
-            "lab_baseline": LAB_BASELINE, "window_seconds": WINDOW_SECONDS}
+def build_payload(atype, ev, risk="medium", repeat=None):
+    e = {k: ev[k] for k in NUM_KEYS + OPTIONAL_KEYS if ev.get(k) is not None}
+    derived = {}   # computed in code, so the LLM never does arithmetic
+    if "packet_count" in e:   # unknown for distributed_scan: no share then, not a fake 0
+        pk, syn = e["packet_count"] or 0, e.get("syn_count") or 0
+        derived["syn_share_percent"] = round(100 * syn / pk, 1) if pk else 0
+    if "unique_ports" in e:   # no ports at all for arp_spoof
+        derived["unique_ports_per_second"] = round(e["unique_ports"] / WINDOW_SECONDS, 1)
+    p = {"attack_type": atype, "current_risk": risk, "evidence": e,
+         "derived": derived, "rule_threshold": THRESHOLDS.get(atype, {}),
+         "lab_baseline": LAB_BASELINE, "window_seconds": WINDOW_SECONDS}
+    if repeat is not None:
+        p["repeat_rule"] = repeat
+    return p
 
 
 def collect(o, out):
@@ -142,8 +180,9 @@ def call_llm(provider, model, system, payload):
     if provider == "gemini":
         from google import genai
         from google.genai import types
+        # v1beta: on the v1 API (google-genai 3.x default) some models reject system_instruction.
         client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
-                              http_options=types.HttpOptions(timeout=20000))
+                              http_options=types.HttpOptions(timeout=20000, api_version="v1beta"))
         r = client.models.generate_content(
             model=model, contents=json.dumps(payload),
             config=types.GenerateContentConfig(
@@ -182,6 +221,21 @@ def rule_opinion(atype, p):
     if atype == "port_scan":
         hit = e["unique_ports"] >= t["min_unique_ports"]
         why = f"{e['unique_ports']} farklı port görüldü, kural eşiği {t['min_unique_ports']}."
+    elif atype == "tripwire":
+        hits = e.get("tripwire_hits") or 0
+        hit = hits >= t["min_tripwire_hits"]
+        why = (f"Tuzak portlara {hits} bağlantı denemesi görüldü, "
+               f"kural eşiği {t['min_tripwire_hits']}.")
+    elif atype == "distributed_scan":
+        total = e.get("target_unique_ports") or 0
+        hit = total >= t["min_target_unique_ports"]
+        why = (f"{e.get('distributed_sources')} kaynak birlikte {total} farklı portu yokladı, "
+               f"bu kaynağın payı {e.get('unique_ports')}; kural eşiği {t['min_target_unique_ports']}.")
+    elif atype == "arp_spoof":
+        forged = (e.get("gw_impersonation") or 0) + (e.get("binding_conflicts") or 0)
+        hit = forged >= t["min_forged_arp_claims"]
+        why = (f"{forged} sahte ARP mesajı görüldü (gateway taklidi {e.get('gw_impersonation')}, "
+               f"adres çakışması {e.get('binding_conflicts')}); kural eşiği {t['min_forged_arp_claims']}.")
     else:
         hit = e["syn_per_second"] >= t["min_syn_per_second"]
         why = f"Saniyede {e['syn_per_second']} SYN görüldü, kural eşiği {t['min_syn_per_second']}."
@@ -189,31 +243,36 @@ def rule_opinion(atype, p):
             "risk_opinion": "keep", "reasons": [why]}
 
 
-def analyze(atype, ev, mock, risk="medium"):
+def analyze(atype, ev, mock, risk="medium", repeat=None):
     """Router: pick the specialist for this attack type, return its opinion."""
     if atype not in AGENTS:
         return None
     agent = AGENTS[atype]
-    p = build_payload(atype, ev, risk)
+    p = build_payload(atype, ev, risk, repeat)
     provider = None if mock else pick_provider()
     if provider is None:
         return agent, "rules", rule_opinion(atype, p)
     model = model_for(provider)
     try:
-        op = parse_opinion(call_llm(provider, model, COMMON + " " + FOCUS[atype], p))
+        # one retry on HTTP 5xx / timeout; bad JSON or invented numbers are not retried
+        raw, retried = call_with_retry(call_llm, provider, model, COMMON + " " + FOCUS[atype], p)
+        op = parse_opinion(raw)
         bad = unbacked(op["reasons"], p)
         if bad:
             raise ValueError("numbers not in evidence: " + ",".join(bad))
         if risk == "high" and op["risk_opinion"] == "raise":
             op["risk_opinion"] = "keep"   # already at the top level
-        return agent, f"{provider}:{model} (verified)", op
+        return agent, f"{provider}:{model} (verified)" + (" [retry]" if retried else ""), op
     except Exception as ex:
-        return agent, f"rules(fallback:{type(ex).__name__})", rule_opinion(atype, p)
+        again = ",retried" if getattr(ex, "oasis_retried", False) else ""
+        return agent, f"rules(fallback:{type(ex).__name__}{again})", rule_opinion(atype, p)
 
 
 def run_once(db, mock):
-    for _id, ts, atype, ev, risk in pending(db):
-        res = analyze(atype, json.loads(ev) if ev else {}, mock, risk or "medium")
+    for _id, ts, atype, ev, risk, ip, mode, epoch, dur in pending(db):
+        # ip is used for the local repeat count only; it never goes into the payload.
+        repeat = policy.repeat_rule(db, ip, mode, epoch, risk, dur)
+        res = analyze(atype, json.loads(ev) if ev else {}, mock, risk or "medium", repeat)
         if res is None:
             continue
         agent, label, op = res

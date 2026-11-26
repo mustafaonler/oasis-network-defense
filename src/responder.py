@@ -6,22 +6,26 @@ Pipeline: alert -> whitelist -> risk level -> action ladder
 """
 import ipaddress
 import json
+import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
 
+import unblock as unblocker
+from policy import LADDER, REPEAT_WINDOW, RISK, START_STEP
+
 ALERTS_FILE = "data/alerts.jsonl"
+# Unblock requests written by the dashboard; unset (VM): no requests are read.
+UNBLOCK_REQUESTS = os.environ.get("OASIS_UNBLOCK_REQUESTS") or None
 DB_FILE = "data/oasis.db"
 
 # Never block these: gateway, victim, management network.
-WHITELIST = [ipaddress.ip_network(n) for n in
-             ("10.0.1.1/32", "10.0.2.1/32", "10.0.2.10/32", "192.168.56.0/24")]
-
-RISK = {"port_scan": "medium", "syn_flood": "high"}
-START_STEP = {"medium": 0, "high": 1}
-LADDER = [300, 1800, None]   # seconds; None = until removed manually
-REPEAT_WINDOW = 3600         # seconds: a repeat offender escalates
+# OASIS_WHITELIST (comma-separated addresses or networks) overrides the VM list.
+WHITELIST = [ipaddress.ip_network(n.strip()) for n in os.environ.get(
+    "OASIS_WHITELIST", "10.0.1.1/32,10.0.2.1/32,10.0.2.10/32,192.168.56.0/24").split(",")
+    if n.strip()]
 
 blocked_until = {}           # ip -> unix time (inf = manual)
 
@@ -58,6 +62,42 @@ def apply_block(ip, seconds):
     elem = f"{{ {ip} timeout {seconds}s }}" if seconds else f"{{ {ip} }}"
     r = nft("add", "element", "inet", "oasis", "blocklist", elem)
     return r.returncode == 0, r.stderr.strip()
+
+
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def ensure_arp_guard():
+    """ARP table on the gateway: drop ARP from blocked MACs (created on first use only)."""
+    nft("add", "table", "arp", "oasis_arp")
+    nft("add", "set", "arp", "oasis_arp", "macblock", "{ type ether_addr; flags timeout; }")
+    nft("add", "chain", "arp", "oasis_arp", "input",
+        "{ type filter hook input priority 0; policy accept; }")
+    chain = nft("list", "chain", "arp", "oasis_arp", "input")
+    if chain.returncode == 0 and "@macblock" not in chain.stdout:
+        nft("add", "rule", "arp", "oasis_arp", "input", "arp", "saddr", "ether", "@macblock", "drop")
+    return chain.returncode == 0
+
+
+def arp_guard(evidence, seconds):
+    """After an arp_spoof block: ignore that MAC's ARP and forget what it poisoned.
+
+    Both values come from a file, so they are validated before they reach a command.
+    """
+    mac = str((evidence or {}).get("mac", "")).lower()
+    if not MAC_RE.match(mac) or not ensure_arp_guard():
+        return "arp guard skipped"
+    elem = f"{{ {mac} timeout {seconds}s }}" if seconds else f"{{ {mac} }}"
+    ok = nft("add", "element", "arp", "oasis_arp", "macblock", elem).returncode == 0
+    flushed = []
+    for claimed in (evidence or {}).get("claimed_ip_list", []):
+        try:
+            addr = str(ipaddress.ip_address(claimed))
+        except ValueError:
+            continue
+        subprocess.run(["ip", "neigh", "flush", "to", addr], capture_output=True)
+        flushed.append(addr)
+    return f"arp guard: mac {'blocked' if ok else 'NOT blocked'}, neighbours flushed {flushed}"
 
 
 def nft_blocked(ip):
@@ -112,6 +152,8 @@ def process(alert, db, enforce):
 
     extra = f" {label(secs)}" if action == "block" else ""
     print(f"[{mode.upper()}] {ip} {atype} risk={risk} -> {action}{extra}", flush=True)
+    if action == "block" and enforce and atype == "arp_spoof":
+        print("   " + arp_guard(alert.get("evidence"), secs), flush=True)
     db.execute(
         "INSERT INTO events (epoch, ts, source_ip, attack_type, risk, action, "
         "duration_s, mode, reason, evidence) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -120,23 +162,67 @@ def process(alert, db, enforce):
     db.commit()
 
 
+class UnblockRequests:
+    """Unblock requests from the dashboard (OASIS_UNBLOCK_REQUESTS), read-only on this side.
+
+    The dashboard (user nobody) creates and appends the file; we only make the directory
+    writable for it (sticky, not listable) and read new lines. Requests that were waiting
+    when the responder started are ignored. Every request is checked again here: a real
+    IP that the firewall really blocks; anything else is only logged.
+    """
+
+    def __init__(self, path):
+        self.path, self.f = path, None
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        os.chmod(os.path.dirname(path) or ".", 0o1733)
+        if os.path.exists(path):
+            self.f = open(path)
+            self.f.seek(0, 2)
+
+    def poll(self, db):
+        if self.f is None:
+            if not os.path.exists(self.path):
+                return
+            self.f = open(self.path)
+        for _ in range(20):                      # a few per round; the rest wait, none are lost
+            line = self.f.readline()
+            if not line:
+                break
+            try:
+                ip = str(ipaddress.ip_address(json.loads(line)["ip"]))
+            except (ValueError, KeyError, TypeError):
+                print("unblock request ignored: not a valid IP", flush=True)
+                continue
+            if not nft_blocked(ip):
+                print(f"unblock request ignored: {ip} is not blocked", flush=True)
+                continue
+            print(f"unblock request from the dashboard: {ip}", flush=True)
+            unblocker.unblock(ip, db, reason="unblock from dashboard")
+            blocked_until.pop(ip, None)
+
+
 def main():
     replay = "--replay" in sys.argv
     enforce = "--enforce" in sys.argv and not replay   # replay is always dry-run
     db = open_db()
     if enforce:
         ensure_firewall()
+    requests = UnblockRequests(UNBLOCK_REQUESTS) if enforce and UNBLOCK_REQUESTS else None
     open(ALERTS_FILE, "a").close()
     with open(ALERTS_FILE) as f:
         if not replay:
             f.seek(0, 2)
         print(f"Responder started in {'ENFORCE' if enforce else 'DRY-RUN'} mode. "
               "Ctrl+C to stop.", flush=True)
+        if requests:
+            print(f"Accepting unblock requests from {UNBLOCK_REQUESTS}", flush=True)
         while True:
             line = f.readline()
             if not line:
                 if replay:
                     break
+                if requests:
+                    requests.poll(db)
                 time.sleep(0.5)
                 continue
             process(json.loads(line), db, enforce)
