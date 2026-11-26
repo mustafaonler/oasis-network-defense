@@ -36,12 +36,12 @@ The working VM version stays on `main` and is tagged **`demo-v2`**.
 
 | Component | Role | Talks to the LLM? | Touches the firewall? |
 |---|---|---|---|
-| `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, per-target summaries for the distributed rule, forged-ARP findings for the MITM rule and a per-second live summary for the dashboard) | No | No |
+| `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, per-target summaries for the distributed rule, forged-ARP findings for the MITM rule and a per-second live summary for the dashboard, including packets one host relays for another) | No | No |
 | `detector.py` | Per-source rules, first match wins: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood`; ≥ 1 SYN to a tripwire port (Docker lab: 21, 23, 445, 3389) → `tripwire`. Per-target rule: ≥ 20 ports of one target from ≥ 2 sources with ≥ 3 ports each, none of them ≥ 20 alone → `distributed_scan` for each of those sources. ARP rule: ≥ 1 forged ARP claim (the gateway's IP, or an IP another host used in the last 30 s) → `arp_spoof` for the IP behind that MAC | No | No |
-| `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log; for `arp_spoof` also an ARP blocklist for the MAC and a flush of the poisoned gateway ARP entries. In the Docker lab it also carries out unblock requests from the dashboard (checked again: valid IP, really in the blocklist) | No | **Yes** |
+| `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log; for `arp_spoof` also an ARP blocklist for the MAC, a drop of every frame from that MAC, a flush of the poisoned gateway ARP entries and, while the MAC stays blocked, gratuitous ARP for the gateway's real MAC. In the Docker lab it also carries out unblock requests from the dashboard (checked again: valid IP, really in the blocklist) | No | **Yes** |
 | `explainer.py` | Explains each block in Turkish (3–4 sentences), number-verified | Yes (numbers only) | No |
 | `specialist.py` | Router picks `PortScanAgent` or `SynFloodAgent` for a second opinion (JSON) | Yes (numbers only) | No |
-| `unblock.py` | Manual unblock (IP, and the MAC of an ARP spoofing block), logged to the event table | No | **Yes** |
+| `unblock.py` | Manual unblock (IP, and the MAC of an ARP spoofing block from both MAC sets), logged to the event table | No | **Yes** |
 | `policy.py` | Action ladder constants and the repeat count, shared by the responder and the agents (no firewall code) | No | No |
 | `dashboard.py` | Web view of `oasis.db` for the analyst: lab diagram, events, explanations, opinions, active blocks. Its only write is an unblock request appended to a queue file; the responder carries it out | No | No |
 
@@ -89,8 +89,10 @@ How the lab is kept offline and isolated:
 - The lab networks are **not** `internal: true`, on purpose: Docker then drops routed
   traffic between the two subnets, so the gateway could not route at all.
 
-Least privilege: every OASIS service starts with `cap_drop: [ALL]`. Only the sensor gets
-`NET_RAW` and only the responder gets `NET_ADMIN`. The detector has no network at all.
+Least privilege: every OASIS service starts with `cap_drop: [ALL]`. The sensor gets
+`NET_RAW` (sniffing) and the responder `NET_ADMIN` (nftables) plus `NET_RAW`, used only to
+send the gateway's corrective ARP announcements after ARP spoofing (unset
+`OASIS_ARP_DEFEND_IP`, as on the VM, sends none). The detector has no network at all.
 The dashboard gets no capabilities, runs as `nobody` with a read-only root file system and
 `no-new-privileges`, mounts `oasis-data` read-only and is not on the lab or mgmt networks.
 Its only writable mount is the small `oasis-requests` volume for unblock requests; it never
@@ -505,6 +507,58 @@ What a forged claim did to the gateway in test M3, and how the response undid it
 | R4 | Dashboard lists the `arp_spoof` events | Pass |
 | S | Scenario with the new phase 6, run twice: 11 / 11 PASS each (2 min 38 s), LLM 12 / 12 verified both times | Pass |
 
+### MITM: a real attack, visible in the dashboard
+
+Three forged ARP packets are enough for the rule, but they show nothing: no traffic is
+redirected. The attacker image now has `mitm.py`, a lab-only man in the middle (it refuses
+addresses outside its own subnet). Every second it tells the target "the gateway is at my
+MAC" and the gateway "the target is at my MAC". Docker containers forward packets
+(`ip_forward=1`), so the target keeps working while its traffic passes through the
+attacker, and `mitm.py` prints the requests and replies it sees.
+
+```bash
+# a host that browses (here attacker 3 plays the normal user)
+docker compose exec --index 3 attacker sh -c 'while true; do curl -s -o /dev/null -w "%{http_code}\n" http://10.10.2.10/; sleep 1; done'
+# the man in the middle (attacker 1), Ctrl+C stops it and repairs the target's entry
+docker compose exec --index 1 attacker mitm.py <ip of attacker 3>
+```
+
+What makes it visible, and what the defense now adds:
+
+- **Sensor (live view only):** a packet whose source IP belongs to one host but arrives from
+  the MAC of another host was relayed. The live summary counts these per second
+  (`relayed`, `via`) and the forged ARP claims per sender (`arp`). A relaying MAC never
+  becomes the owner of the IP it relays, also after 30 s.
+- **Dashboard:** forged claims are purple dots from the sender to the gateway; relayed
+  packets loop from the victim's box through the attacker's box (purple dashed path), with
+  the tags *MITM kurbanı* and *sahte ARP n/s*.
+- **Responder:** besides the IP and the ARP blocklist, every frame from the blocked MAC is
+  dropped in `inet oasis` (relayed packets carry the victim's IP, so the IP blocklist alone
+  would let them through). The gateway cannot stop frames between two other hosts, so
+  while a MAC is blocked it announces its real MAC every 0.3 s (gratuitous ARP). Linux
+  always accepts a gratuitous ARP and then ignores ordinary forged replies for about a
+  second, so the victim's entry is corrected and stays correct. The announcements stop by
+  themselves when no MAC is blocked any more (checked every 5 s).
+
+| # | Test | Result |
+|---|---|---|
+| U9 | 9 new unit tests (23 ARP tests in total): relay never becomes owner; relayed packets and forged claims per second, own traffic and normal ARP not counted, VM counts nothing; frame drop rule and element; gratuitous ARP bytes; blocked-MAC check; `unblock.py` clears both MAC sets. Dashboard: `relayed` / `via` / `arp` validated (31 tests) | Pass |
+| M5 | User (attacker 3) browses every second, `mitm.py` on attacker 1 for 25 s | see below |
+
+M5 timeline (sampled once a second):
+
+| Time | Victim's ARP entry for the gateway | Relayed packets per s | `mitm.py` |
+|---|---|---|---|
+| t+1 s | gateway's real MAC | 0 | starts poisoning |
+| t+2…5 s | **attacker's MAC** | 7 of 7 | prints `GET / HTTP/1.1`, `HTTP/1.0 200 OK`, page text |
+| ≈ t+6 s | responder: `arp_spoof` → IP and MAC blocked, frames dropped, gateway entry flushed, announcements start | | |
+| t+7…41 s | real MAC again (one sample at t+14 s showed the attacker's MAC, the next one was correct) | 0 | `last 5 s: 0 packets passed through me` |
+
+The user got 45 / 45 HTTP 200: the attack and the defense never broke its traffic.
+`unblock.py` then removed the MAC from both sets and the announcements stopped (170 sent).
+In the browser, the purple path and both tags appeared during the attack and the looping
+dots stopped with the block.
+
 ### Dashboard: unblock button
 
 | # | Test | Result |
@@ -601,6 +655,13 @@ What a forged claim did to the gateway in test M3, and how the response undid it
   socket, which is root on the host). The `dash` network has outbound internet access,
   because Docker publishes no ports on `internal` networks; the dashboard makes no outbound
   requests.
+- **ARP defense works only from the gateway.** The gateway cannot drop frames that the
+  attacker sends straight to another host (Docker's bridge is the switch). Its
+  announcements win against ordinary forged replies (Linux ARP locktime), but an attacker
+  that itself sends gratuitous ARP more often could still poison a host for short moments;
+  those packets are then dropped at the gateway, not read. A real network would add switch
+  protection (Dynamic ARP Inspection) or static entries. The MITM is visible only until the
+  block, about one window (≤ 5 s) after the first forged claim.
 - **Unblock button has no login.** The dashboard trusts everyone who can reach
   `127.0.0.1:8080` on the Docker host. Other web pages are stopped by the `Origin`, header
   and content-type checks, but any local program on the host (for example `curl` with the
@@ -652,6 +713,9 @@ What a forged claim did to the gateway in test M3, and how the response undid it
 - One LLM retry after HTTP 5xx / timeouts (`src/retry.py`), with `[retry]` in the label
 - MITM / ARP spoofing: gateway impersonation and address conflicts detected, offender blocked
   by IP and MAC, poisoned gateway ARP entries repaired; `ArpSpoofAgent`; scenario phase 6
+- Real MITM demo (`mitm.py` in the attacker image) shown live in the dashboard (relayed
+  packets, forged claims); the block also drops the relay's frames and the gateway repairs
+  poisoned hosts with gratuitous ARP
 - Scenario script (`scripts/scenario.sh`): normal user plus a staged attack chain with IP
   hopping, checked phase by phase, PASS/FAIL report; `user` service in a compose profile
 

@@ -112,12 +112,20 @@ arp_stats = defaultdict(new_arp_stats)   # offending mac -> findings of the curr
 
 
 def learn(mac, ip, t):
-    """Record that ip was used from mac, unless another MAC holds it right now."""
+    """Record that ip was used from mac, unless another MAC holds it right now.
+
+    A MAC already known by another IP is relaying someone else's packets (a man in the
+    middle): it never becomes the owner of that IP, and its own IP is returned.
+    Otherwise None.
+    """
     with arp_lock:
-        mac_first_ip.setdefault(mac, ip)
+        first = mac_first_ip.setdefault(mac, ip)
+        if first != ip:
+            return first
         prev = ip_owner.get(ip)
         if prev is None or prev[0] == mac or t - prev[1] > ARP_CONFLICT_AGE:
             ip_owner[ip] = (mac, t)
+        return None
 
 
 def handle_arp(pkt, now=None):
@@ -129,6 +137,7 @@ def handle_arp(pkt, now=None):
     if mac == GUARD["own_mac"] or claim == "0.0.0.0":     # our own ARP, or an ARP probe
         return
     t = now if now is not None else time.time()
+    who = None
     with arp_lock:
         if claim in GUARD["protected"]:
             st = arp_stats[mac]
@@ -144,6 +153,10 @@ def handle_arp(pkt, now=None):
                 mac_first_ip.setdefault(mac, claim)
         if st is not None:
             st["claimed"].add(claim)
+            who = mac_first_ip.get(mac)
+    if who and LIVE_FILE:
+        with live_lock:
+            live_arp[who] += 1          # forged claims per second, for the live view only
 
 
 def is_dns_lookup(pkt):
@@ -154,10 +167,11 @@ def is_dns_lookup(pkt):
 
 
 def new_live():
-    return {"pkts": 0, "syn": 0, "ports": set(), "fwd": 0}
+    return {"pkts": 0, "syn": 0, "ports": set(), "fwd": 0, "relayed": 0, "via": None}
 
 
 live = defaultdict(new_live)   # counts of the current second
+live_arp = defaultdict(int)    # IP of a MAC sending forged ARP -> claims in the current second
 live_lock = threading.Lock()
 
 
@@ -183,8 +197,9 @@ def handle(pkt):
                     ts = targets[pkt[IP].dst][pkt[IP].src]
                     ts["ports"].add(syn_port)
                     ts["syn"] += 1
+    via = None
     if ARP_FILE and Ether in pkt:
-        learn(pkt[Ether].src.lower(), pkt[IP].src, time.time())
+        via = learn(pkt[Ether].src.lower(), pkt[IP].src, time.time())
     if LIVE_FILE:
         with live_lock:
             lv = live[pkt[IP].src]
@@ -192,6 +207,16 @@ def handle(pkt):
             if syn_port is not None:
                 lv["syn"] += 1
                 lv["ports"].add(syn_port)
+            if via:                       # this source's packet arrived from another host's MAC
+                lv["relayed"] += 1
+                lv["via"] = via
+
+
+def live_source(v):
+    out = {"pkts": v["pkts"], "syn": v["syn"], "ports": len(v["ports"]), "fwd": v["fwd"]}
+    if v["relayed"]:
+        out["relayed"], out["via"] = v["relayed"], v["via"]
+    return out
 
 
 def live_bucket(t):
@@ -199,11 +224,15 @@ def live_bucket(t):
     with live_lock:
         snap = dict(live)
         live.clear()
+        arp = dict(live_arp)
+        live_arp.clear()
     top = sorted(snap.items(), key=lambda kv: kv[1]["pkts"] + kv[1]["fwd"], reverse=True)
-    return {"t": t,
-            "sources": {ip: {"pkts": v["pkts"], "syn": v["syn"], "ports": len(v["ports"]),
-                             "fwd": v["fwd"]} for ip, v in top[:LIVE_MAX_SOURCES]},
-            "dropped_sources": max(0, len(top) - LIVE_MAX_SOURCES)}
+    out = {"t": t,
+           "sources": {ip: live_source(v) for ip, v in top[:LIVE_MAX_SOURCES]},
+           "dropped_sources": max(0, len(top) - LIVE_MAX_SOURCES)}
+    if arp:
+        out["arp"] = dict(sorted(arp.items(), key=lambda kv: -kv[1])[:LIVE_MAX_SOURCES])
+    return out
 
 
 def write_live(seconds, path):

@@ -126,18 +126,20 @@ services:
       OASIS_TARGET_FILE: data/targets.jsonl  # distributed rule input (from the sensor)
       OASIS_ARP_FILE: data/arp.jsonl         # ARP spoofing rule input (from the sensor)
 
-  # Writes nft rules into the gateway's network namespace.
+  # Writes nft rules into the gateway's network namespace. NET_RAW only for the
+  # gateway's corrective ARP announcements while a MAC is blocked for ARP spoofing.
   responder:
     <<: *core
     command: ["python3", "src/responder.py", "--enforce"]
     network_mode: "service:gateway"
-    cap_add: [NET_ADMIN]
+    cap_add: [NET_ADMIN, NET_RAW]
     volumes:
       - oasis-data:/app/data
       - oasis-requests:/app/requests   # unblock requests from the dashboard (read here)
     environment:
       OASIS_WHITELIST: *whitelist_ips
       OASIS_UNBLOCK_REQUESTS: requests/unblock.jsonl
+      OASIS_ARP_DEFEND_IP: 10.10.1.254         # announce the gateway's real MAC after ARP spoofing
     depends_on: [gateway, detector]
 
   explainer:

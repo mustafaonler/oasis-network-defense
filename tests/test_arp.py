@@ -89,6 +89,57 @@ class SensorGuard(unittest.TestCase):
         self.assertEqual(rec["claimed_ip_list"], [USER_IP])
         self.assertEqual(sensor.ip_owner[USER_IP][0], USER_MAC)   # owner unchanged
 
+    def test_relay_never_becomes_owner(self):
+        sensor.learn(USER_MAC, USER_IP, 100)
+        sensor.learn(ATT_MAC, ATT_IP, 100)
+        self.assertEqual(sensor.learn(ATT_MAC, USER_IP, 100 + 10 * sensor.ARP_CONFLICT_AGE), ATT_IP)
+        self.assertEqual(sensor.ip_owner[USER_IP][0], USER_MAC)   # even long after the user's last packet
+        self.assertIsNone(sensor.learn(USER_MAC, USER_IP, 101))   # own packets are not relayed
+
+
+class LiveMitm(unittest.TestCase):
+    """Live view (dashboard only): relayed packets and forged ARP claims per second."""
+
+    def setUp(self):
+        reset()
+        sensor.live.clear()
+        sensor.live_arp.clear()
+        self.saved = (sensor.ARP_FILE, sensor.LIVE_FILE, dict(sensor.GUARD))
+        sensor.ARP_FILE, sensor.LIVE_FILE = "unused", "unused"
+        sensor.GUARD.update(own_mac=GW_MAC, protected={GW_IP})
+
+    def tearDown(self):
+        sensor.ARP_FILE, sensor.LIVE_FILE, guard = self.saved
+        sensor.GUARD.clear()
+        sensor.GUARD.update(guard)
+        sensor.live.clear()
+        sensor.live_arp.clear()
+        reset()
+
+    def test_relayed_packets_and_forged_claims_counted(self):
+        sensor.handle(ip_pkt(USER_MAC, USER_IP))
+        sensor.handle(ip_pkt(ATT_MAC, ATT_IP))
+        for _ in range(3):
+            sensor.handle(ip_pkt(ATT_MAC, USER_IP))                # user's packets through the attacker
+        sensor.handle_arp(arp(ATT_MAC, USER_IP))                   # forged: user's IP at my MAC
+        sensor.handle_arp(arp(ATT_MAC, GW_IP))                     # forged: gateway at my MAC
+        b = sensor.live_bucket(1)
+        self.assertEqual(b["sources"][USER_IP]["pkts"], 4)
+        self.assertEqual((b["sources"][USER_IP]["relayed"], b["sources"][USER_IP]["via"]), (3, ATT_IP))
+        self.assertNotIn("relayed", b["sources"][ATT_IP])          # its own packets are not relayed
+        self.assertEqual(b["arp"], {ATT_IP: 2})
+        self.assertNotIn("arp", sensor.live_bucket(2))             # reset every second
+
+    def test_normal_arp_not_counted(self):
+        sensor.handle_arp(arp(USER_MAC, USER_IP))
+        self.assertNotIn("arp", sensor.live_bucket(1))
+
+    def test_vm_counts_nothing(self):
+        sensor.ARP_FILE, sensor.LIVE_FILE = None, None
+        sensor.handle(ip_pkt(ATT_MAC, USER_IP))
+        sensor.handle_arp(arp(ATT_MAC, GW_IP))
+        self.assertEqual((dict(sensor.live), dict(sensor.live_arp)), ({}, {}))
+
 
 def rec(**kw):
     r = {"window_start": "t0", "window_end": "t1", "mac": ATT_MAC, "source_ip": ATT_IP,
@@ -155,6 +206,58 @@ class ResponderGuard(unittest.TestCase):
         responder.arp_guard({"mac": ATT_MAC}, None)
         self.assertIn(("add", "element", "arp", "oasis_arp", "macblock", f"{{ {ATT_MAC} }}"),
                       self.nft_calls)
+
+    def test_frames_from_the_mac_dropped(self):
+        out = responder.arp_guard({"mac": ATT_MAC, "claimed_ip_list": [USER_IP]}, 1800)
+        self.assertIn(("add", "rule", "inet", "oasis", "forward", "ether", "saddr", "@macblock",
+                       "drop"), self.nft_calls)
+        self.assertIn(("add", "element", "inet", "oasis", "macblock",
+                       f"{{ {ATT_MAC} timeout 1800s }}"), self.nft_calls)
+        self.assertIn("frames dropped", out)
+
+    def test_vm_has_no_defender(self):
+        self.assertIsNone(responder.DEFEND_IP)
+        self.assertIsNone(responder.defender)
+
+    def test_gratuitous_arp_frame(self):
+        f = responder.garp_frame("12:2e:c5:b0:3c:22", "10.10.1.254")
+        p = Ether(f)
+        self.assertEqual((p.dst, p.src, p.type), ("ff:ff:ff:ff:ff:ff", "12:2e:c5:b0:3c:22", 0x0806))
+        self.assertEqual((p[ARP].op, p[ARP].hwsrc, p[ARP].psrc, p[ARP].pdst),
+                         (1, "12:2e:c5:b0:3c:22", "10.10.1.254", "10.10.1.254"))
+        self.assertEqual(len(f), 42)
+
+    def test_mac_blocked_reads_the_set(self):
+        class Out:
+            def __init__(self, code, text):
+                self.returncode, self.stdout = code, text
+        for code, text, want in ((0, "set macblock { elements = { 02:00:00:00:00:66 } }", True),
+                                 (0, "set macblock { type ether_addr }", False),
+                                 (1, "", False)):
+            responder.nft = lambda *a, c=code, t=text: Out(c, t)
+            self.assertEqual(responder.mac_blocked(), want)
+
+
+class UnblockMac(unittest.TestCase):
+    def test_both_mac_sets_cleared(self):
+        import json
+        import sqlite3
+        import unblock
+        db = sqlite3.connect(":memory:")
+        db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, source_ip, attack_type, action, evidence)")
+        db.execute("INSERT INTO events (source_ip, attack_type, action, evidence) VALUES (?,?,?,?)",
+                   (ATT_IP, "arp_spoof", "block", json.dumps({"mac": ATT_MAC})))
+        calls, saved = [], unblock.subprocess.run
+
+        class Done:
+            returncode = 0
+        unblock.subprocess.run = lambda cmd, **kw: calls.append(cmd) or Done()
+        try:
+            unblock.unblock_mac(db, ATT_IP)
+        finally:
+            unblock.subprocess.run = saved
+        self.assertEqual(calls, [["nft", "delete", "element", "arp", "oasis_arp", "macblock", f"{{ {ATT_MAC} }}"],
+                                 ["nft", "delete", "element", "inet", "oasis", "macblock", f"{{ {ATT_MAC} }}"]])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@
   --line: #9aa4b1;
   --row-hover: #eef3fb;
   --row-sel: #dde8fa;
+  --arp: #7b3fbf;
   --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -35,13 +36,14 @@
     --line: #5b6573;
     --row-hover: #222b36;
     --row-sel: #263852;
+    --arp: #c39af0;
   }
 }
 :root[data-theme="dark"] {
   --bg: #111418; --surface: #1a1f25; --border: #2f3640; --text: #e4e8ee; --muted: #9aa4b1;
   --accent: #7aa7f0; --normal: #5fc48a; --normal-bg: #16301f; --alarm: #f0b04a;
   --alarm-bg: #3a2a0f; --blocked: #f07a72; --blocked-bg: #3d1a18; --node-bg: #232a32;
-  --line: #5b6573; --row-hover: #222b36; --row-sel: #263852;
+  --line: #5b6573; --row-hover: #222b36; --row-sel: #263852; --arp: #c39af0;
 }
 
 * { box-sizing: border-box; }
@@ -103,6 +105,9 @@ main { max-width: 1280px; margin: 0 auto; padding: 16px 24px 48px; display: grid
 #diagram .wire.lane { stroke-dasharray: 2 4; }
 #diagram .pkt { fill: var(--accent); }
 #diagram .pkt.drop { fill: var(--blocked); }
+#diagram .pkt.arp { fill: var(--arp); }
+#diagram .wire.mitm { stroke: var(--arp); stroke-width: 2; stroke-dasharray: 5 4; }
+#diagram text.mitm-tag { fill: var(--arp); font-weight: 600; font-size: 11px; }
 
 .legend { list-style: none; display: flex; flex-wrap: wrap; gap: 6px 18px; padding: 0; margin: 10px 0 6px; font-size: 0.85rem; }
 .dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
@@ -111,6 +116,8 @@ main { max-width: 1280px; margin: 0 auto; padding: 16px 24px 48px; display: grid
 .dot.blocked { background: var(--blocked); }
 .dot.pkt { background: var(--accent); width: 8px; height: 8px; }
 .dot.drop { background: var(--blocked); width: 8px; height: 8px; }
+.dot.arp { background: var(--arp); width: 8px; height: 8px; }
+.dash-line { display: inline-block; width: 18px; border-top: 2px dashed var(--arp); margin-right: 6px; vertical-align: 3px; }
 .statuses { display: flex; flex-direction: column; gap: 2px; }
 
 /* Tables */

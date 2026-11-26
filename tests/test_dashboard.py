@@ -187,6 +187,21 @@ class LiveFile(unittest.TestCase):
         self.assertEqual(len(r["seconds"]), 1)
         self.assertEqual(list(r["seconds"][0]["sources"]), ["10.10.1.64"])
 
+    def test_mitm_fields_checked(self):
+        base = {"pkts": 4, "syn": 0, "ports": 0, "fwd": 4}
+        self.put(live_doc(self.now, [{"t": 1, "sources": {
+            "10.10.1.69": dict(base, relayed=3, via="10.10.1.65"),     # valid: passes
+            "10.10.1.70": dict(base, relayed=3, via=XSS),              # bad relay IP: fields dropped
+            "10.10.1.71": dict(base, relayed=-2, via="10.10.1.65"),    # bad count: fields dropped
+        }, "arp": {"10.10.1.65": 2, XSS: 5, "10.10.1.66": "7", "10.10.1.67": 0}}]))
+        sec = dashboard.read_live(self.path, self.now)["seconds"][0]
+        self.assertEqual(sec["sources"]["10.10.1.69"], dict(base, relayed=3, via="10.10.1.65"))
+        self.assertEqual(sec["sources"]["10.10.1.70"], base)
+        self.assertEqual(sec["sources"]["10.10.1.71"], base)
+        self.assertEqual(sec["arp"], {"10.10.1.65": 2})
+        self.put(live_doc(self.now, [{"t": 1, "sources": {}, "arp": "junk"}]))
+        self.assertEqual(dashboard.read_live(self.path, self.now)["seconds"][0]["arp"], {})
+
     def test_stale_missing_bad_and_large(self):
         self.put(live_doc(self.now - 10, []))
         self.assertTrue(dashboard.read_live(self.path, self.now)["stale"])

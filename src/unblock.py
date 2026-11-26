@@ -16,15 +16,17 @@ MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 
 
 def unblock_mac(db, ip):
-    """Drop the MAC of this IP's latest arp_spoof event from the ARP blocklist, if any."""
+    """Drop the MAC of this IP's latest arp_spoof event from the ARP blocklist and the
+    frame blocklist, if it is there."""
     row = db.execute("SELECT evidence FROM events WHERE source_ip=? AND attack_type='arp_spoof' "
                      "AND action='block' ORDER BY id DESC LIMIT 1", (ip,)).fetchone()
     mac = str(json.loads(row[0] or "{}").get("mac", "")).lower() if row else ""
     if MAC_RE.match(mac):
-        r = subprocess.run(["nft", "delete", "element", "arp", "oasis_arp", "macblock",
-                            f"{{ {mac} }}"], capture_output=True, text=True)
-        if r.returncode == 0:
-            print(f"arp unblock: {mac}")
+        for family, table in (("arp", "oasis_arp"), ("inet", "oasis")):
+            r = subprocess.run(["nft", "delete", "element", family, table, "macblock",
+                                f"{{ {mac} }}"], capture_output=True, text=True)
+            if r.returncode == 0:
+                print(f"{family} mac unblock: {mac}", flush=True)
 
 
 def unblock(ip, db, reason="manual unblock"):

@@ -255,8 +255,24 @@ def read_live(path=LIVE_FILE, now=None):
             vals = {k: count(c.get(k)) for k in LIVE_COUNTERS}
             if None in vals.values():
                 continue
+            relayed = count(c.get("relayed"))
+            if relayed:                 # packets of this source that came through another host
+                try:
+                    vals["via"] = str(ipaddress.ip_address(c.get("via")))
+                    vals["relayed"] = relayed
+                except (ValueError, TypeError):
+                    pass
             sources[ip] = vals
-        seconds.append({"t": sec["t"], "sources": sources})
+        arp = {}                        # forged ARP claims per sending host in this second
+        items = sec.get("arp") if isinstance(sec.get("arp"), dict) else {}
+        for ip, n in list(items.items())[:LIVE_MAX_SOURCES]:
+            try:
+                ip = str(ipaddress.ip_address(ip))
+            except ValueError:
+                continue
+            if count(n):
+                arp[ip] = n
+        seconds.append({"t": sec["t"], "sources": sources, "arp": arp})
     return {"ok": True, "stale": now - updated > LIVE_STALE, "error": None,
             "now": now, "updated": updated, "seconds": seconds}
 

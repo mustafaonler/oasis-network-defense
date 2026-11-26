@@ -38,6 +38,8 @@
       <li><span class="dot blocked"></span>engelli</li>
       <li><span class="dot pkt"></span>ölçülen paket (gateway'den geçti)</li>
       <li><span class="dot drop"></span>gateway'de kaldı (iletilmedi)</li>
+      <li><span class="dot arp"></span>sahte ARP iddiası</li>
+      <li><span class="dash-line"></span>MITM yolu (paket başka bir hostun MAC'inden geldi)</li>
     </ul>
     <p class="note">Durumlar Docker'dan değil, olay kayıtlarından hesaplanır. Saldırganlar:
       son 1 saatte olayı olan, hâlâ engelli olan veya son 10 sn'de trafik gönderen IP'ler.</p>
@@ -45,6 +47,9 @@
       10 pkt/s'ye kadar 1 nokta = 1 paket, üstünde logaritmik ölçek. Kesin değer kutudaki pkt/s.
       Victim'e geçen noktaların oranı, gateway'in victim tarafında ölçülen iletilen paket
       oranıdır. Yanıt paketleri gösterilmez.</p>
+    <p class="note">MITM: gateway'e bir hostun IP'siyle ama başka bir hostun MAC'iyle gelen
+      paketler ölçülür; bu paketler kurbanın kutusundan aracının kutusuna dolaşan mor kesikli
+      yoldan çizilir. Mor noktalar sensörün saydığı sahte ARP iddialarıdır.</p>
   </section>
 
   <section class="panel">

@@ -98,6 +98,20 @@ function liveRate(ip) {
   const s = b && b.sources[ip];
   return s ? s : { pkts: 0, syn: 0, ports: 0, fwd: 0 };
 }
+function liveArp(ip) {
+  const b = latestBucket();
+  return (b && b.arp && b.arp[ip]) || 0;
+}
+function relayPairs() {
+  // victim of a man in the middle -> the host its packets came through (kept seconds)
+  const out = new Map();
+  if (live.ok && !live.stale) {
+    for (const sec of live.seconds) {
+      for (const [ip, s] of Object.entries(sec.sources)) if (s.relayed && s.via) out.set(ip, s.via);
+    }
+  }
+  return out;
+}
 function liveTotals() {
   const b = latestBucket();
   let pkts = 0, fwd = 0;
@@ -107,14 +121,21 @@ function liveTotals() {
 function liveSources() {
   // sources seen in the kept seconds (about 10 s), so a short burst keeps its box a while
   const out = new Set();
-  if (live.ok && !live.stale) for (const sec of live.seconds) for (const ip of Object.keys(sec.sources)) out.add(ip);
+  if (live.ok && !live.stale) {
+    for (const sec of live.seconds) {
+      for (const ip of Object.keys(sec.sources)) out.add(ip);
+      for (const ip of Object.keys(sec.arp || {})) out.add(ip);   // forged ARP, maybe no IP traffic
+    }
+  }
   return out;
 }
 
 // ---------- diagram ----------
 let staticLayer = null, dotLayer = null;
 let paths = new Map();        // ip -> polyline for its dots
+let relayPaths = new Map();   // ip -> polyline through the host that relays its packets
 let liveText = new Map();     // ip -> pkt/s text node
+let tagText = new Map();      // ip -> MITM tag text node
 let gwLiveText = null, vicLiveText = null;
 let diagramKey = "";
 
@@ -157,13 +178,31 @@ function bezierPoints(x1, y1, x2, y2, n) {
   }
   return pts;
 }
-function makePath(ax, ay) {
-  // attacker -> gateway entrance (dots of dropped packets stop here) -> across -> victim
-  const pts = bezierPoints(ax, ay, GW.x, LANE_Y, 24);
+function finishPath(pts, entrance) {
+  // entrance: index of the gateway entrance point (dots of dropped packets stop there)
   pts.push([GW.x + GW.w, LANE_Y], [VIC.x, LANE_Y]);
   const cum = [0];
   for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
-  return { pts, cum, stop: cum[24] + 6, total: cum[cum.length - 1] };
+  return { pts, cum, stop: cum[entrance] + 6, total: cum[cum.length - 1] };
+}
+function makePath(ax, ay) {
+  // attacker -> gateway entrance -> across -> victim
+  return finishPath(bezierPoints(ax, ay, GW.x, LANE_Y, 24), 24);
+}
+const LOOP_X = 300;           // how far the relay loop between two boxes bulges out
+function loopD(x, y1, y2) {
+  return `M${x} ${y1} C${LOOP_X} ${y1}, ${LOOP_X} ${y2}, ${x} ${y2}`;
+}
+function makeRelayPath(x, uy, ay) {
+  // victim of the MITM -> the relaying host -> gateway entrance -> across -> victim server
+  const pts = [];
+  for (let i = 0; i <= 16; i++) {
+    const t = i / 16, u = 1 - t;
+    pts.push([u * u * u * x + 3 * u * u * t * LOOP_X + 3 * u * t * t * LOOP_X + t * t * t * x,
+              u * u * u * uy + 3 * u * u * t * uy + 3 * u * t * t * ay + t * t * t * ay]);
+  }
+  const rest = bezierPoints(x, ay, GW.x, LANE_Y, 24).slice(1);
+  return finishPath(pts.concat(rest), pts.length + 23);
 }
 function pointAt(p, d) {
   let i = 1;
@@ -185,7 +224,10 @@ function renderDiagram() {
   const layer = staticLayer;
   clear(layer);
   paths = new Map();
+  relayPaths = new Map();
   liveText = new Map();
+  tagText = new Map();
+  const boxY = new Map();     // ip -> y of the middle of its box
   const hosts = state.hosts;
 
   layer.appendChild(sv("text", { x: 230, y: 24, class: "net" }, "attacker-net 10.10.1.0/24"));
@@ -193,7 +235,8 @@ function renderDiagram() {
 
   // attackers: recent events or live traffic
   let list = diagramAttackers();
-  diagramKey = list.map((a) => a.ip + ":" + a.status).join(",");
+  const relays = relayPairs();
+  diagramKey = diagramKeyOf(list, relays);
   let extra = 0;
   if (list.length > MAX_ATTACKERS) { extra = list.length - (MAX_ATTACKERS - 1); list = list.slice(0, MAX_ATTACKERS - 1); }
   let ay = 34;
@@ -209,9 +252,19 @@ function renderDiagram() {
     const t = sv("text", { x: 210, y: ay + 37, "text-anchor": "end", class: "pps" }, "");
     g.appendChild(t);
     liveText.set(a.ip, t);
+    const tag = sv("text", { x: 210, y: ay + 20, "text-anchor": "end", class: "mitm-tag" }, "");
+    g.appendChild(tag);
+    tagText.set(a.ip, tag);
     wire(layer, 220, ay + 22, GW.x, LANE_Y, st === "blocked");
     paths.set(a.ip, makePath(220, ay + 22));
+    boxY.set(a.ip, ay + 22);
     ay += 52;
+  }
+  // man in the middle: the victim's packets loop through the relaying host's box
+  for (const [ip, via] of relays) {
+    if (!boxY.has(ip) || !boxY.has(via) || ip === via) continue;
+    layer.appendChild(sv("path", { d: loopD(220, boxY.get(ip), boxY.get(via)), class: "wire mitm" }));
+    relayPaths.set(ip, makeRelayPath(220, boxY.get(ip), boxY.get(via)));
   }
   if (extra) {
     node(layer, 10, ay, 210, 36, null, `+${extra} saldırgan daha`, []);
@@ -227,7 +280,7 @@ function renderDiagram() {
   gwLiveText = sv("text", { x: GW.x + GW.w - 10, y: GW.y + 20, "text-anchor": "end", class: "pps" }, "");
   layer.appendChild(gwLiveText);
   layer.appendChild(sv("path", { d: `M${GW.x} ${LANE_Y} H${GW.x + GW.w}`, class: "wire lane" }));
-  const chips = [["sensor", "NET_RAW"], ["responder", "NET_ADMIN"]];
+  const chips = [["sensor", "NET_RAW"], ["responder", "NET_ADMIN/RAW"]];
   chips.forEach(([name, cap], i) => {
     const cx = GW.x + 12 + i * 118, cy = GW.y + 84;
     layer.appendChild(sv("rect", { x: cx, y: cy, width: 108, height: 36, rx: 6, class: "chip" }));
@@ -251,7 +304,7 @@ function renderDiagram() {
     ["detector", "network: none"],
     ["explainer", "mgmt · LLM (öneri)"],
     ["specialist", "mgmt · LLM (öneri)"],
-    ["dashboard", "salt okunur · 127.0.0.1"],
+    ["dashboard", "izleme + istek · 127.0.0.1"],
   ];
   bottom.forEach(([name, sub], i) => {
     const bx = 10 + i * 235, by = 310;
@@ -266,6 +319,10 @@ function updateLiveTexts() {
   for (const [ip, t] of liveText) {
     const r = liveRate(ip);
     t.textContent = fresh ? `${r.pkts} pkt/s` : "";
+  }
+  for (const [ip, t] of tagText) {
+    const r = liveRate(ip), forged = liveArp(ip);
+    t.textContent = !fresh ? "" : forged ? `sahte ARP ${forged}/s` : r.relayed ? "MITM kurbanı" : "";
   }
   const tot = liveTotals();
   if (gwLiveText) gwLiveText.textContent = fresh ? `gelen ${tot.pkts} · iletilen ${tot.fwd} pkt/s` : "";
@@ -282,8 +339,12 @@ function initDots() {
   for (let i = 0; i < DOT_POOL; i++) {
     const c = sv("circle", { r: 3.5, cx: -10, cy: -10, class: "pkt", visibility: "hidden" });
     dotLayer.appendChild(c);
-    dots.push({ el: c, on: false, path: null, d: 0, fwd: true, fade: 0 });
+    dots.push({ el: c, on: false, path: null, d: 0, fwd: true, fade: 0, arp: false });
   }
+}
+function diagramKeyOf(list, relays) {
+  return list.map((a) => a.ip + ":" + a.status).join(",") + "|" +
+    [...relays].map(([ip, via]) => ip + ">" + via).sort().join(",");
 }
 function dotsFor(pkts) {
   if (pkts <= LINEAR_UP_TO) return pkts;
@@ -296,14 +357,20 @@ function onNewBucket(b) {
     const n = dotsFor(s.pkts);
     if (!n) continue;
     const ratio = s.pkts ? Math.min(1, s.fwd / s.pkts) : 0;
-    queues.set(ip, { left: n, interval: 1 / n, next: animClock + 0.5 / n, ratio, i: 0 });
+    const relay = s.pkts && s.relayed ? Math.min(1, s.relayed / s.pkts) : 0;
+    queues.set(ip, { ip, left: n, interval: 1 / n, next: animClock + 0.5 / n, ratio, relay, i: 0 });
+  }
+  // forged ARP claims: purple dots from the sender to the gateway (ARP is never forwarded)
+  for (const [ip, count] of Object.entries(b.arp || {})) {
+    const n = dotsFor(count);
+    if (n) queues.set("arp:" + ip, { ip, arp: true, left: n, interval: 1 / n, next: animClock + 0.25 / n, ratio: 0, relay: 0, i: 0 });
   }
 }
-function spawn(path, fwd) {
+function spawn(path, fwd, arp) {
   const d = dots.find((x) => !x.on);
   if (!d) return;                // pool full: cap reached, skip
-  d.on = true; d.path = path; d.d = 0; d.fwd = fwd; d.fade = 0;
-  d.el.setAttribute("class", "pkt");
+  d.on = true; d.path = path; d.d = 0; d.fwd = fwd; d.fade = 0; d.arp = !!arp;
+  d.el.setAttribute("class", arp ? "pkt arp" : "pkt");
   d.el.setAttribute("opacity", "1");
   d.el.setAttribute("visibility", "visible");
 }
@@ -311,12 +378,13 @@ function frame(ts) {
   const dt = lastFrame ? Math.min(0.1, (ts - lastFrame) / 1000) : 0;
   lastFrame = ts;
   animClock += dt;
-  for (const [ip, q] of queues) {
-    const path = paths.get(ip);
+  for (const q of queues.values()) {
+    const path = paths.get(q.ip), viaPath = relayPaths.get(q.ip);
     while (q.left > 0 && q.next <= animClock) {
-      // spread forwarded dots evenly by the measured forwarded share
+      // spread forwarded (and relayed) dots evenly by the measured shares
       const fwd = Math.floor((q.i + 1) * q.ratio) > Math.floor(q.i * q.ratio);
-      if (path) spawn(path, fwd);
+      const relayed = viaPath && Math.floor((q.i + 1) * q.relay) > Math.floor(q.i * q.relay);
+      if (path) spawn(relayed ? viaPath : path, fwd, q.arp);
       q.left--; q.i++; q.next += q.interval;
     }
   }
@@ -331,7 +399,7 @@ function frame(ts) {
     d.d += DOT_SPEED * dt;
     if (!d.fwd && d.d >= d.path.stop) {
       d.d = d.path.stop; d.fade = 0.5;           // not forwarded: stops at the gateway
-      d.el.setAttribute("class", "pkt drop");
+      if (!d.arp) d.el.setAttribute("class", "pkt drop");   // ARP ends there anyway
     } else if (d.d >= d.path.total) {
       d.on = false; d.el.setAttribute("visibility", "hidden");
       continue;
@@ -354,7 +422,7 @@ function onLive(msg) {
     st.textContent = "Canlı akış: bağlı";
   }
   if (!state) return;
-  const key = diagramAttackers().map((a) => a.ip + ":" + a.status).join(",");
+  const key = diagramKeyOf(diagramAttackers(), relayPairs());
   if (key !== diagramKey) renderDiagram();
   else updateLiveTexts();
   const b = latestBucket();
