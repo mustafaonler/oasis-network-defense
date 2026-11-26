@@ -1,5 +1,7 @@
-// OASIS dashboard. Read-only: polls /api/state and listens to /api/live, never sends data.
-// Every database string is written with textContent (no HTML parsing), so it stays plain text.
+// OASIS dashboard. Polls /api/state and listens to /api/live. The only thing it sends is an
+// unblock request (POST /api/unblock) when the user clicks "Engeli kaldır" and confirms;
+// the responder does the unblock. Every database string is written with textContent
+// (no HTML parsing), so it stays plain text.
 "use strict";
 
 const REFRESH_MS = 5000;
@@ -375,6 +377,60 @@ function startLive() {
   };
 }
 
+// ---------- unblock ----------
+const pending = new Set();    // IPs with a request on its way
+const armed = new Map();      // ip -> time the first click expires (two-step confirm in the page)
+const CONFIRM_MS = 5000;
+function showMessage(text, bad) {
+  const m = document.getElementById("action-msg");
+  m.hidden = false;
+  m.className = bad ? "status stale" : "status";
+  m.textContent = text;
+}
+function onUnblockClick(ip) {
+  // First click arms the button for a few seconds, the second click sends the request.
+  if ((armed.get(ip) || 0) < Date.now()) {
+    armed.set(ip, Date.now() + CONFIRM_MS);
+    showMessage(ip + ": engeli kaldırmak için " + CONFIRM_MS / 1000 + " sn içinde tekrar tıklayın.", false);
+    render();
+    setTimeout(() => { if ((armed.get(ip) || 0) <= Date.now()) { armed.delete(ip); render(); } }, CONFIRM_MS + 50);
+    return;
+  }
+  armed.delete(ip);
+  requestUnblock(ip);
+}
+async function requestUnblock(ip) {
+  pending.add(ip);
+  render();
+  try {
+    const r = await fetch("/api/unblock", {
+      method: "POST", cache: "no-store", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-OASIS-Action": "unblock" },
+      body: JSON.stringify({ ip: ip }),
+    });
+    const reply = await r.json().catch(() => ({}));
+    if (r.status === 202) showMessage(ip + ": engel kaldırma isteği gönderildi, responder işliyor…", false);
+    else showMessage(ip + ": istek reddedildi (" + (reply.error || "HTTP " + r.status) + ")", true);
+  } catch (e) {
+    showMessage(ip + ": sunucuya ulaşılamadı", true);
+  }
+  setTimeout(() => { pending.delete(ip); refresh(); }, 2000);
+}
+function unblockCell(ip) {
+  const td = el("td");
+  if (!state.can_unblock) return td;
+  const busy = pending.has(ip);
+  const sure = (armed.get(ip) || 0) > Date.now();
+  const b = el("button", sure ? "btn-unblock armed" : "btn-unblock",
+               busy ? "gönderiliyor…" : sure ? "Onayla: kaldır" : "Engeli kaldır");
+  b.type = "button";
+  b.disabled = busy;
+  b.addEventListener("click", (e) => { e.stopPropagation(); onUnblockClick(ip); });
+  b.addEventListener("keydown", (e) => e.stopPropagation());
+  td.appendChild(b);
+  return td;
+}
+
 // ---------- blocked list ----------
 function renderBlocked() {
   const tb = document.getElementById("blocked");
@@ -383,7 +439,7 @@ function renderBlocked() {
   if (!state.blocked.length) {
     const tr = el("tr");
     const td = el("td", "empty", "Şu an engelli IP yok.");
-    td.colSpan = 5;
+    td.colSpan = 6;
     tr.appendChild(td);
     tb.appendChild(tr);
     return;
@@ -398,6 +454,7 @@ function renderBlocked() {
     if (b.expires === null) rem.textContent = "manuel kaldırılana kadar";
     else countdowns.push([rem, b.expires]);
     tr.appendChild(rem);
+    tr.appendChild(unblockCell(b.ip));
     tb.appendChild(tr);
   }
   tick();
@@ -414,11 +471,13 @@ function renderEvents() {
   if (!state.events.length) {
     const tr = el("tr");
     const td = el("td", "empty", "Henüz olay yok.");
-    td.colSpan = 7;
+    td.colSpan = 8;
     tr.appendChild(td);
     tb.appendChild(tr);
     return;
   }
+  // The button goes only on the event that caused a block still in force.
+  const activeIds = new Set(state.blocked.map((b) => b.event_id));
   for (const ev of state.events) {
     const tr = el("tr");
     tr.tabIndex = 0;
@@ -435,6 +494,7 @@ function renderEvents() {
     if (ev.mode && ev.mode !== "enforce") act.appendChild(el("span", "muted", " (" + ev.mode + ")"));
     tr.appendChild(act);
     tr.appendChild(el("td", null, blockLabel(ev)));
+    tr.appendChild(activeIds.has(ev.id) ? unblockCell(ev.source_ip) : el("td"));
     const pick = () => { selectedId = ev.id; renderEvents(); renderDetail(); };
     tr.addEventListener("click", pick);
     tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });

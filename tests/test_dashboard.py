@@ -353,6 +353,90 @@ class Http(unittest.TestCase):
             r, _ = self.req("GET", p)
             self.assertEqual(r.status, 404, p)
 
+    def test_unblock_off_without_request_dir(self):
+        r, _ = self.req("POST", "/api/unblock", body=b'{"ip": "10.10.1.64"}')
+        self.assertEqual(r.status, 405)
+        _, body = self.req("GET", "/api/state")
+        self.assertFalse(json.loads(body)["can_unblock"])
+
+
+class UnblockApi(unittest.TestCase):
+    HOST = "good.test:1"
+
+    def setUp(self):
+        self.f = Fixture()
+        now = time.time()
+        self.f.event(now - 20, "10.10.1.64", "block", 300)             # blocked
+        self.f.event(now - 20, "10.10.1.65", "block", 300)
+        self.f.event(now - 10, "10.10.1.65", "unblock")                 # not blocked any more
+        self.reqdir = tempfile.TemporaryDirectory()
+        self.srv = dashboard.make_server("127.0.0.1", 0, self.f.path, {self.HOST},
+                                         request_dir=self.reqdir.name)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.f.close()
+        self.reqdir.cleanup()
+
+    def post(self, body=b'{"ip": "10.10.1.64"}', origin="http://good.test:1",
+             action="unblock", ctype="application/json"):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.putrequest("POST", "/api/unblock", skip_host=True)
+        c.putheader("Host", self.HOST)
+        for k, v in (("Origin", origin), ("X-OASIS-Action", action), ("Content-Type", ctype)):
+            if v is not None:
+                c.putheader(k, v)
+        c.putheader("Content-Length", str(len(body)))
+        c.endheaders()
+        c.send(body)
+        r = c.getresponse()
+        data = r.read()
+        c.close()
+        return r.status, data
+
+    def lines(self):
+        path = os.path.join(self.reqdir.name, dashboard.REQUEST_FILE)
+        if not os.path.exists(path):
+            return []
+        with open(path) as fh:
+            return [json.loads(x) for x in fh]
+
+    def test_good_request_is_queued(self):
+        status, body = self.post()
+        self.assertEqual(status, 202, body)
+        [req] = self.lines()
+        self.assertEqual((req["ip"], req["via"]), ("10.10.1.64", "dashboard"))
+
+    def test_bad_requests_are_refused_and_not_queued(self):
+        cases = [
+            ({"origin": None}, 403), ({"origin": "http://evil.example"}, 403),
+            ({"origin": "http://good.test:1.evil"}, 403), ({"action": None}, 403),
+            ({"ctype": "text/plain"}, 415), ({"body": b'{"ip": "1.2.3"}'}, 400),
+            ({"body": b'{"ip": "10.10.1.64; rm -rf /"}'}, 400), ({"body": b"[]"}, 400),
+            ({"body": b'{"ip": "10.10.1.65"}'}, 409), ({"body": b'{"ip": "10.10.1.99"}'}, 409),
+            ({"body": b'{"ip": "10.10.1.64", "x": "' + b"a" * 300 + b'"}'}, 413),
+        ]
+        for kw, code in cases:
+            status, _ = self.post(**kw)
+            self.assertEqual(status, code, kw)
+        self.assertEqual(self.lines(), [])
+
+    def test_rate_limit(self):
+        codes = [self.post()[0] for _ in range(dashboard.REQUEST_LIMIT + 1)]
+        self.assertEqual(codes[:-1], [202] * dashboard.REQUEST_LIMIT)
+        self.assertEqual(codes[-1], 429)
+
+    def test_state_says_button_is_on(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.putrequest("GET", "/api/state", skip_host=True)
+        c.putheader("Host", self.HOST)
+        c.endheaders()
+        self.assertTrue(json.loads(c.getresponse().read())["can_unblock"])
+        c.close()
+
 
 if __name__ == "__main__":
     unittest.main()

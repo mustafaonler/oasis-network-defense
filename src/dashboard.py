@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""OASIS dashboard: a read-only web view of the event database.
+"""OASIS dashboard: a web view of the event database.
 
-Never writes: the database is opened with mode=ro and query_only, and in Docker
+Never writes to the database: it is opened with mode=ro and query_only, and in Docker
 the data volume is mounted read-only. Never touches the firewall: the blocklist
 shown here is computed from the event log, not read from nftables.
-Only GET is served; every database string is sent as JSON and shown as plain text.
+Every database string is sent as JSON and shown as plain text.
+
+The one write: with OASIS_REQUEST_DIR set, POST /api/unblock appends an unblock
+request for a blocked IP to a request file. The responder reads that file, checks the
+request again and does the unblock itself. Unset: GET only, fully read-only.
 """
+import collections
 import ipaddress
 import json
 import os
@@ -38,6 +43,14 @@ LIVE_MAX_SOURCES = 64
 LIVE_POLL = 0.25         # how often a stream checks the file
 SSE_MAX = 4              # concurrent live streams (each holds one server thread)
 LIVE_COUNTERS = ("pkts", "syn", "ports", "fwd")
+
+# Unblock requests: the only thing the dashboard may write (to its own request volume).
+REQUEST_DIR = os.environ.get("OASIS_REQUEST_DIR") or None
+REQUEST_FILE = "unblock.jsonl"
+REQUEST_MAX_BODY = 256        # bytes: {"ip": "..."} is far smaller
+REQUEST_MAX_FILE = 1024 * 1024
+REQUEST_LIMIT, REQUEST_PERIOD = 10, 60   # at most 10 requests a minute
+ACTION_HEADER = "X-OASIS-Action"         # a custom header: a cross-site form cannot send it
 
 STATIC = {             # exact paths only: no file system lookups from the URL
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -264,6 +277,9 @@ class Handler(BaseHTTPRequestHandler):
     live_path = LIVE_FILE
     allowed_hosts = ALLOWED_HOSTS
     sse_slots = threading.BoundedSemaphore(SSE_MAX)
+    request_dir = None            # unblock requests off unless make_server() turns them on
+    rate = collections.deque()
+    rate_lock = threading.Lock()
 
     def send(self, code, body=b"", ctype="text/plain; charset=utf-8", extra=None):
         self.send_response(code)
@@ -317,7 +333,9 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 self.sse_slots.release()
         if path == "/api/state":
-            body = json.dumps(read_state(self.db_path), ensure_ascii=False).encode()
+            st = read_state(self.db_path)
+            st["can_unblock"] = self.request_dir is not None
+            body = json.dumps(st, ensure_ascii=False).encode()
             return self.send(200, body, "application/json; charset=utf-8")
         if path == "/favicon.ico":
             return self.send(204)
@@ -329,17 +347,69 @@ class Handler(BaseHTTPRequestHandler):
     def refuse(self):
         self.send(405, b"method not allowed\n", extra={"Allow": "GET"})
 
-    do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = refuse
+    def reply(self, code, obj, extra=None):
+        self.send(code, json.dumps(obj).encode(), "application/json; charset=utf-8", extra)
+
+    def rate_ok(self):
+        now = time.time()
+        with self.rate_lock:
+            while self.rate and self.rate[0] < now - REQUEST_PERIOD:
+                self.rate.popleft()
+            if len(self.rate) >= REQUEST_LIMIT:
+                return False
+            self.rate.append(now)
+            return True
+
+    def do_POST(self):
+        if self.headers.get("Host", "") not in self.allowed_hosts:
+            return self.send(403, b"forbidden host\n")
+        if urllib.parse.urlsplit(self.path).path != "/api/unblock" or self.request_dir is None:
+            return self.refuse()
+        # Same-origin only: the browser always sends Origin on a POST from a page.
+        if self.headers.get("Origin", "") != "http://" + self.headers.get("Host", ""):
+            return self.reply(403, {"ok": False, "error": "wrong origin"})
+        if self.headers.get(ACTION_HEADER, "") != "unblock":
+            return self.reply(403, {"ok": False, "error": "missing action header"})
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            return self.reply(415, {"ok": False, "error": "JSON only"})
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return self.reply(411, {"ok": False, "error": "length required"})
+        if not 0 < length <= REQUEST_MAX_BODY:
+            return self.reply(413, {"ok": False, "error": "body too large"})
+        try:
+            ip = str(ipaddress.ip_address(json.loads(self.rfile.read(length))["ip"]))
+        except (ValueError, KeyError, TypeError):
+            return self.reply(400, {"ok": False, "error": "a valid IP is required"})
+        if not self.rate_ok():
+            return self.reply(429, {"ok": False, "error": "too many requests"}, {"Retry-After": "60"})
+        if ip not in {b["ip"] for b in read_state(self.db_path)["blocked"]}:
+            return self.reply(409, {"ok": False, "error": "this IP is not blocked"})
+        path = os.path.join(self.request_dir, REQUEST_FILE)
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > REQUEST_MAX_FILE:
+                return self.reply(503, {"ok": False, "error": "request file full"})
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, "a") as f:
+                f.write(json.dumps({"ip": ip, "time": time.time(), "via": "dashboard"}) + "\n")
+        except OSError:
+            return self.reply(503, {"ok": False, "error": "request queue not ready"})
+        return self.reply(202, {"ok": True, "ip": ip})
+
+    do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = refuse
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
 
 
-def make_server(bind=BIND, port=PORT, db_path=DB_FILE, allowed_hosts=None, live_path=LIVE_FILE):
+def make_server(bind=BIND, port=PORT, db_path=DB_FILE, allowed_hosts=None, live_path=LIVE_FILE,
+                request_dir=REQUEST_DIR):
     handler = type("BoundHandler", (Handler,), {
         "static": load_static(), "db_path": db_path, "live_path": live_path,
         "sse_slots": threading.BoundedSemaphore(SSE_MAX),
-        "allowed_hosts": set(allowed_hosts) if allowed_hosts else ALLOWED_HOSTS})
+        "allowed_hosts": set(allowed_hosts) if allowed_hosts else ALLOWED_HOSTS,
+        "request_dir": request_dir, "rate": collections.deque(), "rate_lock": threading.Lock()})
     srv = ThreadingHTTPServer((bind, port), handler)
     srv.daemon_threads = True   # open live streams never block shutdown
     return srv
@@ -347,7 +417,8 @@ def make_server(bind=BIND, port=PORT, db_path=DB_FILE, allowed_hosts=None, live_
 
 def main():
     srv = make_server()
-    print(f"Dashboard on {BIND}:{PORT} (read-only, db={DB_FILE}, live={LIVE_FILE}). "
+    mode = f"unblock requests to {REQUEST_DIR}" if REQUEST_DIR else "read-only"
+    print(f"Dashboard on {BIND}:{PORT} ({mode}, db={DB_FILE}, live={LIVE_FILE}). "
           f"Allowed hosts: {', '.join(sorted(ALLOWED_HOSTS))}", flush=True)
     srv.serve_forever()
 

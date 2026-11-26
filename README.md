@@ -38,12 +38,12 @@ The working VM version stays on `main` and is tagged **`demo-v2`**.
 |---|---|---|---|
 | `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, per-target summaries for the distributed rule, forged-ARP findings for the MITM rule and a per-second live summary for the dashboard) | No | No |
 | `detector.py` | Per-source rules, first match wins: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood`; ≥ 1 SYN to a tripwire port (Docker lab: 21, 23, 445, 3389) → `tripwire`. Per-target rule: ≥ 20 ports of one target from ≥ 2 sources with ≥ 3 ports each, none of them ≥ 20 alone → `distributed_scan` for each of those sources. ARP rule: ≥ 1 forged ARP claim (the gateway's IP, or an IP another host used in the last 30 s) → `arp_spoof` for the IP behind that MAC | No | No |
-| `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log; for `arp_spoof` also an ARP blocklist for the MAC and a flush of the poisoned gateway ARP entries | No | **Yes** |
+| `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log; for `arp_spoof` also an ARP blocklist for the MAC and a flush of the poisoned gateway ARP entries. In the Docker lab it also carries out unblock requests from the dashboard (checked again: valid IP, really in the blocklist) | No | **Yes** |
 | `explainer.py` | Explains each block in Turkish (3–4 sentences), number-verified | Yes (numbers only) | No |
 | `specialist.py` | Router picks `PortScanAgent` or `SynFloodAgent` for a second opinion (JSON) | Yes (numbers only) | No |
 | `unblock.py` | Manual unblock (IP, and the MAC of an ARP spoofing block), logged to the event table | No | **Yes** |
 | `policy.py` | Action ladder constants and the repeat count, shared by the responder and the agents (no firewall code) | No | No |
-| `dashboard.py` | Read-only web view of `oasis.db` for the analyst: lab diagram, events, explanations, opinions, active blocks | No | No |
+| `dashboard.py` | Web view of `oasis.db` for the analyst: lab diagram, events, explanations, opinions, active blocks. Its only write is an unblock request appended to a queue file; the responder carries it out | No | No |
 
 **Block duration ladder** (`responder.py`): `LADDER = [5 min, 30 min, until manual unblock]`.
 The start step comes from the risk level (`port_scan` = medium → step 0,
@@ -73,7 +73,7 @@ one step up. Unblocking does not reset that count.
                  dash 10.10.8.0/24 (only network of the dashboard)
               ┌────────────┐
               │ dashboard  │ ──> 127.0.0.1:8080 on the host; oasis-data mounted read-only
-              └────────────┘
+              └────────────┘     unblock requests: oasis-requests volume → responder
 ```
 
 How the lab is kept offline and isolated:
@@ -93,6 +93,8 @@ Least privilege: every OASIS service starts with `cap_drop: [ALL]`. Only the sen
 `NET_RAW` and only the responder gets `NET_ADMIN`. The detector has no network at all.
 The dashboard gets no capabilities, runs as `nobody` with a read-only root file system and
 `no-new-privileges`, mounts `oasis-data` read-only and is not on the lab or mgmt networks.
+Its only writable mount is the small `oasis-requests` volume for unblock requests; it never
+runs `nft` and never writes to the database.
 `.env`, `data/` and `.git` are excluded from images by `.dockerignore`.
 
 ## Setup and usage
@@ -210,6 +212,16 @@ Open <http://127.0.0.1:8080> on the Docker host. The page refreshes every 5 seco
 - **Events** (newest 200). Click a row for the rule reason, the explainer text, the
   specialist opinion and the sensor evidence.
 
+**Unblock button.** In the Docker lab every active block, and the event row that started
+it, has an *Engeli kaldır* button. The first click arms it for 5 seconds (*Onayla: kaldır*),
+the second click sends the request. The dashboard itself cannot unblock anything: it only
+appends `{"ip": …}` to `requests/unblock.jsonl` on the `oasis-requests` volume. The
+responder reads new lines every idle second, checks again that the IP is valid and really
+in the gateway's blocklist, then runs the same code as `unblock.py` (IP, the MAC of an ARP
+spoofing block, and an `unblock` event with the reason `unblock from dashboard`). Requests
+already waiting when the responder starts are not replayed. `OASIS_REQUEST_DIR` unset
+(the VM) hides the button and refuses every `POST`.
+
 **Live traffic.** In the Docker lab the sensor also writes `data/live.json`: per-source
 packet, SYN and distinct-port counts for each of the last 10 seconds, rewritten atomically
 every second (under 1 KB in tests, at most about 64 sources × 10 seconds). It also counts,
@@ -228,10 +240,15 @@ streams). The diagram then shows:
 No traffic means no dots. With the sensor stopped, the page says so and draws nothing.
 `OASIS_LIVE_FILE` unset (the VM) turns all of this off and the sensor behaves as before.
 
-Security: only `GET` is served, the `Host` header must be `127.0.0.1:8080` or
-`localhost:8080` (against DNS rebinding), a strict Content-Security-Policy allows only the
-page's own files, and every database string is written with `textContent`, so it is shown
-as plain text and never parsed as HTML. The page loads nothing from a CDN.
+Security: `GET` plus one `POST` (`/api/unblock`, only with the request queue on); the `Host`
+header must be `127.0.0.1:8080` or `localhost:8080` (against DNS rebinding), a strict
+Content-Security-Policy allows only the page's own files, and every database string is
+written with `textContent`, so it is shown as plain text and never parsed as HTML. The page
+loads nothing from a CDN. The `POST` also needs `Origin` equal to the page's own address,
+the header `X-OASIS-Action: unblock` and `Content-Type: application/json` (a foreign web
+page cannot send these without a CORS preflight, which the dashboard never answers), a
+body of at most 256 bytes with a valid IP that is currently blocked, and at most 10
+requests per minute. The queue file is opened with `O_NOFOLLOW` and capped at 1 MB.
 If you publish the dashboard on another host port, change `OASIS_DASH_HOSTS` to match.
 
 Unit tests (run inside the images, no Python needed on the host):
@@ -243,6 +260,7 @@ docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev pyth
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_detector.py -v
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/agents:dev python3 -m unittest discover -s tests -p test_retry.py -v
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_arp.py -v
+docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_unblock_requests.py -v
 ```
 
 ## Test results
@@ -487,6 +505,17 @@ What a forged claim did to the gateway in test M3, and how the response undid it
 | R4 | Dashboard lists the `arp_spoof` events | Pass |
 | S | Scenario with the new phase 6, run twice: 11 / 11 PASS each (2 min 38 s), LLM 12 / 12 verified both times | Pass |
 
+### Dashboard: unblock button
+
+| # | Test | Result |
+|---|---|---|
+| U7 | Dashboard (29 unit tests in total): request queue off → `POST` 405 and no button; correct request queued (202); wrong `Origin`, missing action header, wrong content type, bad IP, IP not blocked and oversized body refused (403 / 415 / 400 / 409 / 413) and nothing written; 11th request in a minute → 429 | Pass |
+| U8 | Responder (5 unit tests): VM reads no requests; request directory `1733`, file left to the dashboard; requests waiting before the start are not replayed; only valid and really blocked IPs are unblocked; nothing lost above 20 requests per round | Pass |
+| K7 | `docker inspect`: dashboard still user `nobody`, read-only root, no capabilities, `oasis-data` `RW=false`; only `oasis-requests` is writable | Pass |
+| L1 | Live: wrong `Origin` → 403, IP not blocked → 409 | Pass |
+| L2 | Live: two clicks on *Engeli kaldır* for a blocked attacker: IP leaves the nftables set within 2 s, its ARP-block MAC too, `unblock` event with reason `unblock from dashboard` | Pass |
+| L3 | From an attacker container: `host.docker.internal` does not resolve, dashboard port `10.10.8.2:8080` filtered (the attacker was not blocked at the time) | Pass |
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -572,6 +601,11 @@ What a forged claim did to the gateway in test M3, and how the response undid it
   socket, which is root on the host). The `dash` network has outbound internet access,
   because Docker publishes no ports on `internal` networks; the dashboard makes no outbound
   requests.
+- **Unblock button has no login.** The dashboard trusts everyone who can reach
+  `127.0.0.1:8080` on the Docker host. Other web pages are stopped by the `Origin`, header
+  and content-type checks, but any local program on the host (for example `curl` with the
+  right headers) can send an unblock request for a blocked IP. The lab has a single
+  analyst; a shared host would need authentication first.
 - **Live view limits.** Only attacker → victim traffic is shown; replies are not. Values
   have one-second resolution, and forwarded counts arrive in 0.1 s batches, so near a
   second boundary "forwarded" can differ from "incoming" by a few percent (totals match; a
@@ -580,8 +614,9 @@ What a forged claim did to the gateway in test M3, and how the response undid it
   traffic of the others counts in the gateway total but has no dots. At about 6500 pkt/s
   the scapy sniffer itself starts to lose a few packets (under 1 %), with or without the
   live view.
-- **No automated test suite for the pipeline.** The tests above are manual command
-  sequences; only the dashboard has unit tests.
+- **No automated end-to-end test suite.** The live tests above are manual command
+  sequences or `scripts/scenario.sh`; unit tests cover the dashboard, sensor, detector,
+  ARP guard, LLM retry and the unblock queue, not the whole pipeline.
 - **Tested only on Docker Desktop for Windows.** Other Docker hosts may behave differently.
 
 ## Status
@@ -604,6 +639,9 @@ What a forged claim did to the gateway in test M3, and how the response undid it
   unblocked independently
 - Read-only web dashboard on `127.0.0.1:8080`: lab diagram with host status, event list,
   explanations and opinions, active blocks computed from the log
+- Unblock button in the dashboard (two-step confirm): the dashboard only queues the
+  request, the responder checks it again and unblocks, so the dashboard keeps no
+  capabilities and no database write access
 - Live traffic in the dashboard: per-second sensor summary over SSE, measured pkt/s per
   attacker and dots that stop at the gateway when the forwarded count is 0
 - Tripwire ports (21, 23, 445, 3389): one probe is enough, so a source that changes its IP

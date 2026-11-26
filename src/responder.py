@@ -13,9 +13,12 @@ import subprocess
 import sys
 import time
 
+import unblock as unblocker
 from policy import LADDER, REPEAT_WINDOW, RISK, START_STEP
 
 ALERTS_FILE = "data/alerts.jsonl"
+# Unblock requests written by the dashboard; unset (VM): no requests are read.
+UNBLOCK_REQUESTS = os.environ.get("OASIS_UNBLOCK_REQUESTS") or None
 DB_FILE = "data/oasis.db"
 
 # Never block these: gateway, victim, management network.
@@ -159,23 +162,67 @@ def process(alert, db, enforce):
     db.commit()
 
 
+class UnblockRequests:
+    """Unblock requests from the dashboard (OASIS_UNBLOCK_REQUESTS), read-only on this side.
+
+    The dashboard (user nobody) creates and appends the file; we only make the directory
+    writable for it (sticky, not listable) and read new lines. Requests that were waiting
+    when the responder started are ignored. Every request is checked again here: a real
+    IP that the firewall really blocks; anything else is only logged.
+    """
+
+    def __init__(self, path):
+        self.path, self.f = path, None
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        os.chmod(os.path.dirname(path) or ".", 0o1733)
+        if os.path.exists(path):
+            self.f = open(path)
+            self.f.seek(0, 2)
+
+    def poll(self, db):
+        if self.f is None:
+            if not os.path.exists(self.path):
+                return
+            self.f = open(self.path)
+        for _ in range(20):                      # a few per round; the rest wait, none are lost
+            line = self.f.readline()
+            if not line:
+                break
+            try:
+                ip = str(ipaddress.ip_address(json.loads(line)["ip"]))
+            except (ValueError, KeyError, TypeError):
+                print("unblock request ignored: not a valid IP", flush=True)
+                continue
+            if not nft_blocked(ip):
+                print(f"unblock request ignored: {ip} is not blocked", flush=True)
+                continue
+            print(f"unblock request from the dashboard: {ip}", flush=True)
+            unblocker.unblock(ip, db, reason="unblock from dashboard")
+            blocked_until.pop(ip, None)
+
+
 def main():
     replay = "--replay" in sys.argv
     enforce = "--enforce" in sys.argv and not replay   # replay is always dry-run
     db = open_db()
     if enforce:
         ensure_firewall()
+    requests = UnblockRequests(UNBLOCK_REQUESTS) if enforce and UNBLOCK_REQUESTS else None
     open(ALERTS_FILE, "a").close()
     with open(ALERTS_FILE) as f:
         if not replay:
             f.seek(0, 2)
         print(f"Responder started in {'ENFORCE' if enforce else 'DRY-RUN'} mode. "
               "Ctrl+C to stop.", flush=True)
+        if requests:
+            print(f"Accepting unblock requests from {UNBLOCK_REQUESTS}", flush=True)
         while True:
             line = f.readline()
             if not line:
                 if replay:
                     break
+                if requests:
+                    requests.poll(db)
                 time.sleep(0.5)
                 continue
             process(json.loads(line), db, enforce)

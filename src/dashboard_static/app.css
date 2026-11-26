@@ -120,6 +120,15 @@ th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--bor
 th { color: var(--muted); font-weight: 600; font-size: 0.8rem; }
 td.mono, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 td.empty { color: var(--muted); white-space: normal; }
+.btn-unblock {
+  font: inherit; font-size: 0.8rem; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  color: var(--blocked); background: var(--blocked-bg); border: 1px solid var(--blocked);
+}
+.btn-unblock:hover:not(:disabled) { filter: brightness(1.15); }
+.btn-unblock:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn-unblock:disabled { opacity: 0.6; cursor: default; }
+.btn-unblock.armed { color: #fff; background: var(--blocked); font-weight: 600; }
+#action-msg { margin: 6px 0 8px; }
 .events tbody tr { cursor: pointer; }
 .events tbody tr:hover { background: var(--row-hover); }
 .events tbody tr.sel { background: var(--row-sel); }

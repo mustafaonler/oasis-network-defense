@@ -132,8 +132,12 @@ services:
     command: ["python3", "src/responder.py", "--enforce"]
     network_mode: "service:gateway"
     cap_add: [NET_ADMIN]
+    volumes:
+      - oasis-data:/app/data
+      - oasis-requests:/app/requests   # unblock requests from the dashboard (read here)
     environment:
       OASIS_WHITELIST: *whitelist_ips
+      OASIS_UNBLOCK_REQUESTS: requests/unblock.jsonl
     depends_on: [gateway, detector]
 
   explainer:
@@ -156,8 +160,10 @@ services:
     read_only: true
     user: "65534:65534"
     volumes:
-      - oasis-data:/app/data:ro
+      - oasis-data:/app/data:ro                           # the database stays read-only
+      - oasis-requests:/app/requests                      # its only write: unblock requests
     environment:
+      OASIS_REQUEST_DIR: requests                         # turns the unblock button on
       OASIS_DASH_BIND: 0.0.0.0                            # inside the container only
       OASIS_DASH_HOSTS: "127.0.0.1:8080,localhost:8080"   # Host header allowlist
       OASIS_LIVE_FILE: data/live.json                     # written by the sensor
@@ -195,3 +201,4 @@ networks:
 
 volumes:
   oasis-data:
+  oasis-requests:   # dashboard -> responder unblock requests only

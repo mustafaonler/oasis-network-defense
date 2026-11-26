@@ -11,7 +11,7 @@
 <header class="top">
   <div>
     <h1>OASIS Panel</h1>
-    <p class="sub">Salt okunur izleme · veriler <code>oasis.db</code> olay kayıtlarından</p>
+    <p class="sub">İzleme · tek yazma işlemi engel kaldırma isteği · veriler <code>oasis.db</code> olay kayıtlarından</p>
   </div>
   <div class="statuses">
     <p id="status" class="status" role="status">Yükleniyor…</p>
@@ -50,10 +50,12 @@
   <section class="panel">
     <h2>Şu an engelli IP'ler</h2>
     <p class="note">Gateway'e sorulmadan olay kayıtlarından hesaplanır
-      (son engelleme − sonraki manuel kaldırma − süresi dolanlar).</p>
+      (son engelleme − sonraki manuel kaldırma − süresi dolanlar).
+      "Engeli kaldır": ilk tıklama onay ister, ikinci tıklama isteği gönderir; engeli responder kaldırır.</p>
+    <p id="action-msg" class="status" role="status" hidden></p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>IP</th><th>Olay türü</th><th>Başlangıç</th><th>Süre</th><th>Kalan</th></tr></thead>
+        <thead><tr><th>IP</th><th>Olay türü</th><th>Başlangıç</th><th>Süre</th><th>Kalan</th><th>İşlem</th></tr></thead>
         <tbody id="blocked"></tbody>
       </table>
     </div>
@@ -65,7 +67,7 @@
     <div class="events-grid">
       <div class="table-wrap">
         <table class="events">
-          <thead><tr><th>#</th><th>Zaman</th><th>Kaynak IP</th><th>Tür</th><th>Risk</th><th>Aksiyon</th><th>Engel süresi</th></tr></thead>
+          <thead><tr><th>#</th><th>Zaman</th><th>Kaynak IP</th><th>Tür</th><th>Risk</th><th>Aksiyon</th><th>Engel süresi</th><th>İşlem</th></tr></thead>
           <tbody id="events"></tbody>
         </table>
       </div>
