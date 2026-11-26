@@ -13,7 +13,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime
 
-from scapy.all import sniff, IP, TCP, UDP, get_if_addr, get_if_list
+from scapy.all import sniff, ARP, Ether, IP, TCP, UDP, get_if_addr, get_if_hwaddr, get_if_list
 
 WINDOW = 5  # seconds
 # Validated with ipaddress so only real addresses reach the BPF filter.
@@ -46,6 +46,14 @@ TRIPWIRE_PORTS = parse_ports(_tw) if _tw else None
 # sources touched (the only case the distributed rule looks at). Unset (VM): off.
 TARGET_FILE = os.environ.get("OASIS_TARGET_FILE") or None
 TARGET_MIN_SOURCES = 2
+
+# ARP guard (MITM): every ARP message claims "this IP is at this MAC". A claim for the
+# gateway's own IP from another MAC is gateway impersonation; a claim for an IP that
+# another MAC used within ARP_CONFLICT_AGE seconds is an address conflict. Findings go
+# to OASIS_ARP_FILE once per window, per offending MAC. Unset (VM): nothing changes.
+ARP_FILE = os.environ.get("OASIS_ARP_FILE") or None
+ARP_CONFLICT_AGE = 30
+GUARD = {"own_mac": None, "protected": set()}   # filled in main() from the interface
 
 # Live view (dashboard only, never used for detection). Unset (VM): nothing changes.
 # OASIS_LIVE_FILE: per-second, per-source counts of the last LIVE_KEEP seconds,
@@ -92,6 +100,52 @@ targets = defaultdict(new_target)   # destination -> sources (filled only with T
 lock = threading.Lock()
 
 
+def new_arp_stats():
+    return {"gw_impersonation": 0, "binding_conflicts": 0, "claimed": set()}
+
+
+arp_lock = threading.Lock()
+ip_owner = {}                       # ip -> (mac, last time seen), from IP traffic and ARP
+mac_first_ip = {}                   # mac -> first IP seen from it; never overwritten, so a
+                                    # MITM relaying someone else's packets is not given their IP
+arp_stats = defaultdict(new_arp_stats)   # offending mac -> findings of the current window
+
+
+def learn(mac, ip, t):
+    """Record that ip was used from mac, unless another MAC holds it right now."""
+    with arp_lock:
+        mac_first_ip.setdefault(mac, ip)
+        prev = ip_owner.get(ip)
+        if prev is None or prev[0] == mac or t - prev[1] > ARP_CONFLICT_AGE:
+            ip_owner[ip] = (mac, t)
+
+
+def handle_arp(pkt, now=None):
+    """Check one ARP message (request or reply: both make receivers update their cache)."""
+    if ARP not in pkt or Ether not in pkt:
+        return
+    mac = pkt[Ether].src.lower()
+    claim = pkt[ARP].psrc
+    if mac == GUARD["own_mac"] or claim == "0.0.0.0":     # our own ARP, or an ARP probe
+        return
+    t = now if now is not None else time.time()
+    with arp_lock:
+        if claim in GUARD["protected"]:
+            st = arp_stats[mac]
+            st["gw_impersonation"] += 1
+        else:
+            prev = ip_owner.get(claim)
+            if prev and prev[0] != mac and t - prev[1] <= ARP_CONFLICT_AGE:
+                st = arp_stats[mac]
+                st["binding_conflicts"] += 1
+            else:
+                st = None
+                ip_owner[claim] = (mac, t)
+                mac_first_ip.setdefault(mac, claim)
+        if st is not None:
+            st["claimed"].add(claim)
+
+
 def is_dns_lookup(pkt):
     """True for a DNS query to the lab DNS server (port 53, UDP or TCP)."""
     if DNS_SERVER is None or pkt[IP].dst != DNS_SERVER:
@@ -129,6 +183,8 @@ def handle(pkt):
                     ts = targets[pkt[IP].dst][pkt[IP].src]
                     ts["ports"].add(syn_port)
                     ts["syn"] += 1
+    if ARP_FILE and Ether in pkt:
+        learn(pkt[Ether].src.lower(), pkt[IP].src, time.time())
     if LIVE_FILE:
         with live_lock:
             lv = live[pkt[IP].src]
@@ -249,7 +305,23 @@ def target_record(dst, per_source, start, end):
     }
 
 
-def flusher(out, tout=None):
+def arp_record(mac, st, start, end):
+    """One window of suspicious ARP from one MAC. source_ip: the IP that MAC first used."""
+    with arp_lock:
+        source = mac_first_ip.get(mac)
+    return {
+        "window_start": datetime.fromtimestamp(start).isoformat(timespec="seconds"),
+        "window_end": datetime.fromtimestamp(end).isoformat(timespec="seconds"),
+        "mac": mac,
+        "source_ip": source,
+        "gw_impersonation": st["gw_impersonation"],
+        "binding_conflicts": st["binding_conflicts"],
+        "arp_claimed_ips": len(st["claimed"]),
+        "claimed_ip_list": sorted(st["claimed"]),
+    }
+
+
+def flusher(out, tout=None, aout=None):
     while True:
         start = time.time()
         time.sleep(WINDOW)
@@ -259,6 +331,13 @@ def flusher(out, tout=None):
             stats.clear()
             tsnap = dict(targets)
             targets.clear()
+        with arp_lock:
+            asnap = dict(arp_stats)
+            arp_stats.clear()
+        if aout is not None:
+            for mac, st in asnap.items():
+                aout.write(json.dumps(arp_record(mac, st, start, end)) + "\n")
+                aout.flush()
         for ip, st in snapshot.items():
             rec = window_record(ip, st, start, end)
             line = json.dumps(rec)
@@ -296,8 +375,17 @@ def main():
     if tout:
         print(f"Per-target windows: {TARGET_FILE} (targets touched by ≥ {TARGET_MIN_SOURCES} sources)",
               flush=True)
+    aout = None
+    if ARP_FILE:
+        GUARD["own_mac"] = get_if_hwaddr(iface).lower()
+        GUARD["protected"] = {get_if_addr(iface)}
+        aout = open(ARP_FILE, "a")
+        threading.Thread(target=sniff, kwargs={"iface": iface, "filter": "arp", "prn": handle_arp,
+                                               "store": False}, daemon=True).start()
+        print(f"ARP guard: {ARP_FILE} (protects {sorted(GUARD['protected'])} at "
+              f"{GUARD['own_mac']})", flush=True)
     with open(OUTFILE, "a") as out:
-        threading.Thread(target=flusher, args=(out, tout), daemon=True).start()
+        threading.Thread(target=flusher, args=(out, tout, aout), daemon=True).start()
         try:
             sniff(iface=iface, filter=BPF, prn=handle, store=False)
         except KeyboardInterrupt:

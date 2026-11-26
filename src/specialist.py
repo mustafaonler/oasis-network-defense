@@ -22,19 +22,23 @@ WINDOW_SECONDS = 5
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
 # Present only for some events (tripwire sensor, distributed rule); missing ones are left out.
-OPTIONAL_KEYS = ("tripwire_hits", "target_unique_ports", "distributed_sources")
+OPTIONAL_KEYS = ("tripwire_hits", "target_unique_ports", "distributed_sources",
+                 "gw_impersonation", "binding_conflicts", "arp_claimed_ips")
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
               "syn_flood": {"min_syn_per_second": 50},
               "tripwire": {"min_tripwire_hits": 1},
               "distributed_scan": {"min_target_unique_ports": 20, "min_sources": 2,
-                                   "min_ports_per_source": 3}}
+                                   "min_ports_per_source": 3},
+              "arp_spoof": {"min_forged_arp_claims": 1}}
 # Numbers measured in our own lab tests (normal web, SSH, small scans).
 LAB_BASELINE = {"normal_traffic_max_syn_per_second": 3.6,
                 "normal_traffic_unique_ports": 1,
                 "small_scan_ports_that_raised_no_alert": 15,
-                "normal_traffic_tripwire_hits": 0}
+                "normal_traffic_tripwire_hits": 0,
+                "normal_traffic_forged_arp_claims": 0}
 AGENTS = {"port_scan": "PortScanAgent", "syn_flood": "SynFloodAgent",
-          "tripwire": "TripwireAgent", "distributed_scan": "DistributedScanAgent"}
+          "tripwire": "TripwireAgent", "distributed_scan": "DistributedScanAgent",
+          "arp_spoof": "ArpSpoofAgent"}
 
 COMMON = (
     "You are a specialist analyst in an autonomous network defense system. "
@@ -76,6 +80,12 @@ FOCUS = {
         "the threshold, how many sources took part (distributed_sources), this source's "
         "share (unique_ports), and whether the split looks coordinated. Compare with the "
         "lab baseline: normal traffic touches 1 port."),
+    "arp_spoof": (
+        "Your specialty is ARP spoofing (man-in-the-middle). Judge: gw_impersonation "
+        "(forged claims of the gateway's address), binding_conflicts (claims of an address "
+        "another host was using), arp_claimed_ips, and whether this looks like a deliberate "
+        "interception attempt or a misconfiguration. Normal hosts send no forged ARP "
+        "(lab baseline)."),
 }
 
 
@@ -123,7 +133,8 @@ def build_payload(atype, ev, risk="medium", repeat=None):
     if "packet_count" in e:   # unknown for distributed_scan: no share then, not a fake 0
         pk, syn = e["packet_count"] or 0, e.get("syn_count") or 0
         derived["syn_share_percent"] = round(100 * syn / pk, 1) if pk else 0
-    derived["unique_ports_per_second"] = round((e.get("unique_ports") or 0) / WINDOW_SECONDS, 1)
+    if "unique_ports" in e:   # no ports at all for arp_spoof
+        derived["unique_ports_per_second"] = round(e["unique_ports"] / WINDOW_SECONDS, 1)
     p = {"attack_type": atype, "current_risk": risk, "evidence": e,
          "derived": derived, "rule_threshold": THRESHOLDS.get(atype, {}),
          "lab_baseline": LAB_BASELINE, "window_seconds": WINDOW_SECONDS}
@@ -220,6 +231,11 @@ def rule_opinion(atype, p):
         hit = total >= t["min_target_unique_ports"]
         why = (f"{e.get('distributed_sources')} kaynak birlikte {total} farklı portu yokladı, "
                f"bu kaynağın payı {e.get('unique_ports')}; kural eşiği {t['min_target_unique_ports']}.")
+    elif atype == "arp_spoof":
+        forged = (e.get("gw_impersonation") or 0) + (e.get("binding_conflicts") or 0)
+        hit = forged >= t["min_forged_arp_claims"]
+        why = (f"{forged} sahte ARP mesajı görüldü (gateway taklidi {e.get('gw_impersonation')}, "
+               f"adres çakışması {e.get('binding_conflicts')}); kural eşiği {t['min_forged_arp_claims']}.")
     else:
         hit = e["syn_per_second"] >= t["min_syn_per_second"]
         why = f"Saniyede {e['syn_per_second']} SYN görüldü, kural eşiği {t['min_syn_per_second']}."

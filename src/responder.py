@@ -7,6 +7,7 @@ Pipeline: alert -> whitelist -> risk level -> action ladder
 import ipaddress
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -58,6 +59,42 @@ def apply_block(ip, seconds):
     elem = f"{{ {ip} timeout {seconds}s }}" if seconds else f"{{ {ip} }}"
     r = nft("add", "element", "inet", "oasis", "blocklist", elem)
     return r.returncode == 0, r.stderr.strip()
+
+
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def ensure_arp_guard():
+    """ARP table on the gateway: drop ARP from blocked MACs (created on first use only)."""
+    nft("add", "table", "arp", "oasis_arp")
+    nft("add", "set", "arp", "oasis_arp", "macblock", "{ type ether_addr; flags timeout; }")
+    nft("add", "chain", "arp", "oasis_arp", "input",
+        "{ type filter hook input priority 0; policy accept; }")
+    chain = nft("list", "chain", "arp", "oasis_arp", "input")
+    if chain.returncode == 0 and "@macblock" not in chain.stdout:
+        nft("add", "rule", "arp", "oasis_arp", "input", "arp", "saddr", "ether", "@macblock", "drop")
+    return chain.returncode == 0
+
+
+def arp_guard(evidence, seconds):
+    """After an arp_spoof block: ignore that MAC's ARP and forget what it poisoned.
+
+    Both values come from a file, so they are validated before they reach a command.
+    """
+    mac = str((evidence or {}).get("mac", "")).lower()
+    if not MAC_RE.match(mac) or not ensure_arp_guard():
+        return "arp guard skipped"
+    elem = f"{{ {mac} timeout {seconds}s }}" if seconds else f"{{ {mac} }}"
+    ok = nft("add", "element", "arp", "oasis_arp", "macblock", elem).returncode == 0
+    flushed = []
+    for claimed in (evidence or {}).get("claimed_ip_list", []):
+        try:
+            addr = str(ipaddress.ip_address(claimed))
+        except ValueError:
+            continue
+        subprocess.run(["ip", "neigh", "flush", "to", addr], capture_output=True)
+        flushed.append(addr)
+    return f"arp guard: mac {'blocked' if ok else 'NOT blocked'}, neighbours flushed {flushed}"
 
 
 def nft_blocked(ip):
@@ -112,6 +149,8 @@ def process(alert, db, enforce):
 
     extra = f" {label(secs)}" if action == "block" else ""
     print(f"[{mode.upper()}] {ip} {atype} risk={risk} -> {action}{extra}", flush=True)
+    if action == "block" and enforce and atype == "arp_spoof":
+        print("   " + arp_guard(alert.get("evidence"), secs), flush=True)
     db.execute(
         "INSERT INTO events (epoch, ts, source_ip, attack_type, risk, action, "
         "duration_s, mode, reason, evidence) VALUES (?,?,?,?,?,?,?,?,?,?)",

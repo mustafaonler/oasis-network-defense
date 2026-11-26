@@ -111,6 +111,7 @@ services:
       OASIS_SENSOR_DNS_SERVER: 10.10.1.254   # attackers' DNS (see dns: above)
       OASIS_TRIPWIRE_PORTS: "21,23,445,3389" # no lab service there: any SYN is a probe
       OASIS_TARGET_FILE: data/targets.jsonl  # per-target windows for the distributed rule
+      OASIS_ARP_FILE: data/arp.jsonl         # forged ARP (MITM) findings per window
       OASIS_LIVE_FILE: data/live.json        # per-second summary for the dashboard (last 10 s)
       OASIS_LIVE_FWD_IP: 10.10.2.254         # count forwarded packets on the victim side
     depends_on: [gateway]
@@ -118,11 +119,12 @@ services:
   # Only reads and writes files: no network, no capabilities.
   detector:
     <<: *core
-    command: ["sh", "-c", "touch data/windows.jsonl data/alerts.jsonl data/targets.jsonl && exec python3 src/detector.py"]
+    command: ["sh", "-c", "touch data/windows.jsonl data/alerts.jsonl data/targets.jsonl data/arp.jsonl && exec python3 src/detector.py"]
     network_mode: none
     environment:
       OASIS_WHITELIST: &whitelist_ips "10.10.1.1,10.10.1.254,10.10.2.1,10.10.2.254,10.10.2.10"
       OASIS_TARGET_FILE: data/targets.jsonl  # distributed rule input (from the sensor)
+      OASIS_ARP_FILE: data/arp.jsonl         # ARP spoofing rule input (from the sensor)
 
   # Writes nft rules into the gateway's network namespace.
   responder:

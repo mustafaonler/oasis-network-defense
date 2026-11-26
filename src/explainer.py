@@ -21,12 +21,14 @@ MODELS = {"gemini": os.environ.get("OASIS_MODEL", "gemini-2.5-flash"),
 NUM_KEYS = ("packet_count", "syn_count", "unique_ports", "unique_dst_ips",
             "syn_per_second")
 # Present only for some events (tripwire sensor, distributed rule); missing ones are left out.
-OPTIONAL_KEYS = ("tripwire_hits", "target_unique_ports", "distributed_sources")
+OPTIONAL_KEYS = ("tripwire_hits", "target_unique_ports", "distributed_sources",
+                 "gw_impersonation", "binding_conflicts", "arp_claimed_ips")
 THRESHOLDS = {"port_scan": {"min_unique_ports": 20},
               "syn_flood": {"min_syn_per_second": 50},
               "tripwire": {"min_tripwire_hits": 1},
               "distributed_scan": {"min_target_unique_ports": 20, "min_sources": 2,
-                                   "min_ports_per_source": 3}}
+                                   "min_ports_per_source": 3},
+              "arp_spoof": {"min_forged_arp_claims": 1}}
 SYSTEM = (
     "You are a SOC assistant inside an autonomous network defense system. "
     "You receive one event as JSON with numeric fields only. Explain in Turkish, "
@@ -39,6 +41,9 @@ SYSTEM = (
     "For distributed_scan, target_unique_ports is the number of distinct ports of one "
     "target probed by distributed_sources sources together, and unique_ports is this "
     "source's share. "
+    "For arp_spoof (a man-in-the-middle attempt), gw_impersonation counts forged ARP "
+    "claims of the gateway's address, binding_conflicts counts claims of an address "
+    "another host was using, and arp_claimed_ips is how many addresses were claimed. "
     "Do not invent facts, do not give commands, do not suggest actions."
 )
 
@@ -100,6 +105,11 @@ def template_text(p):
                f"toplam {e.get('target_unique_ports')} farklı portunu yokladı (eşik "
                f"{t.get('min_target_unique_ports')}); bu kaynağın payı {e.get('unique_ports')} port. "
                "Tarama kaynaklara bölündüğü için tek tek eşiğin altında kalsa da dağıtık tarama sayıldı.")
+    elif p["attack_type"] == "arp_spoof":
+        why = (f"Tek bir 5 saniyelik pencerede sahte ARP mesajları görüldü: gateway adresini "
+               f"sahiplenme {e.get('gw_impersonation')}, başka bir cihazın adresini sahiplenme "
+               f"{e.get('binding_conflicts')} (eşik {t.get('min_forged_arp_claims')}). Bu, trafiği "
+               "araya girerek okumaya yönelik bir ortadaki adam (MITM) girişimidir.")
     else:
         why = "Kural eşiği aşıldı."
     d = p["block_duration_seconds"]

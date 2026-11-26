@@ -8,8 +8,10 @@ No firewall code here, so the LLM agents can import it without loading nft logic
 # so it starts at the lowest step; repeats escalate on the ladder.
 # distributed_scan: a coordinated scan, but each source's own evidence is small
 # (3+ ports), so it also starts low and escalates on repeats.
+# arp_spoof: a forged ARP claim is unambiguous and enables a man-in-the-middle
+# (reading or changing other hosts' traffic), so it starts at the 30-minute step.
 RISK = {"port_scan": "medium", "syn_flood": "high", "tripwire": "medium",
-        "distributed_scan": "medium"}
+        "distributed_scan": "medium", "arp_spoof": "high"}
 START_STEP = {"medium": 0, "high": 1}
 LADDER = [300, 1800, None]   # seconds; None = until removed manually
 REPEAT_WINDOW = 3600         # seconds: a repeat offender escalates

@@ -2,7 +2,7 @@
 FROM debian:trixie-slim
 RUN apt-get -o Acquire::Retries=5 update \
     && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-       python3 python3-scapy tcpdump nftables \
+       python3 python3-scapy tcpdump nftables iproute2 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY src/ src/

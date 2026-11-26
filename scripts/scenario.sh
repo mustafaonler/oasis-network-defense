@@ -67,20 +67,24 @@ unblock_all() {
     done
 }
 
-say "Setup: 4 attacker containers and a normal user"
-dc up -d --scale attacker=4 >/dev/null 2>&1 || { echo "docker compose up failed"; exit 2; }
+say "Setup: 5 attacker containers and a normal user"
+dc up -d --scale attacker=5 >/dev/null 2>&1 || { echo "docker compose up failed"; exit 2; }
 dc --profile scenario up -d user >/dev/null 2>&1 || { echo "user service failed"; exit 2; }
 sleep 5
 A1=$(ip_of attacker 1); A2=$(ip_of attacker 2); A3=$(ip_of attacker 3); A4=$(ip_of attacker 4)
+A5=$(ip_of attacker 5)
 U=$(ip_of user 1)
-echo "attackers: $A1 $A2 $A3 $A4 | user: $U"
+U_MAC=$(dc exec -T user cat /sys/class/net/eth0/address | tr -d '\r')
+GW_IF=$(dc exec -T gateway ip -o -4 addr show | awk '/10\.10\.1\.254\//{print $2}')
+GW_MAC=$(dc exec -T gateway cat "/sys/class/net/$GW_IF/address" | tr -d '\r')
+echo "attackers: $A1 $A2 $A3 $A4 $A5 | user: $U ($U_MAC) | gateway: $GW_MAC"
 unblock_all
 sleep "$SETTLE"
 T0=$(now)
 
 say "Phase 0: normal browsing for ${NORMAL_TIME}s (user curls the victim every 1-3 s)"
 T=$(now); sleep "$NORMAL_TIME"
-expect_quiet "0 normal browsing" "$T" "$U" "$A1" "$A2" "$A3" "$A4"
+expect_quiet "0 normal browsing" "$T" "$U" "$A1" "$A2" "$A3" "$A4" "$A5"
 
 say "Phase 1: attacker ($A1) quick recon, 15 ports"
 T=$(now); dc exec -T --index 1 attacker nmap -Pn -sS -p 1-15 "$VICTIM" >/dev/null; sleep "$SETTLE"
@@ -106,6 +110,25 @@ say "Phase 5: the admin unblocks $A1, which starts a SYN flood (3000 SYN)"
 dc exec -T responder python3 src/unblock.py "$A1" >/dev/null; sleep 2
 T=$(now); dc exec -T --index 1 attacker hping3 -S -p 80 -c 3000 -i u1000 -q "$VICTIM" >/dev/null 2>&1; sleep "$SETTLE"
 expect_block "5 SYN flood" "$A1" syn_flood "$T"
+
+say "Phase 6: MITM attempt: $A5 tells the gateway that the user's IP ($U) is at its MAC"
+dc exec -T --index 5 attacker ping -c 3 -i 0.5 "$VICTIM" >/dev/null   # its own traffic first
+T=$(now)
+dc exec -T --index 5 attacker python3 -c '
+import sys
+from scapy.all import ARP, Ether, sendp
+gw_mac, user_ip, gw_ip = sys.argv[1:4]
+sendp(Ether(dst=gw_mac) / ARP(op=2, psrc=user_ip, pdst=gw_ip, hwdst=gw_mac),
+      iface="eth0", count=3, verbose=False)' "$GW_MAC" "$U" 10.10.1.254
+sleep "$SETTLE"
+expect_block "6 MITM, ARP spoof" "$A5" arp_spoof "$T"
+for _ in 1 2 3 4 5; do   # the flushed entry is refilled at the user's next request
+    entry=$(dc exec -T gateway ip neigh show "$U" | tr -d '\r')
+    echo "$entry" | grep -q "$U_MAC" && break
+    sleep 1
+done
+if echo "$entry" | grep -q "$U_MAC"; then record "6 gateway ARP repaired" "user at $U_MAC" "${entry:0:40}" 1
+else record "6 gateway ARP repaired" "user at $U_MAC" "${entry:-no entry}" 0; fi
 
 say "Throughout: the normal user"
 expect_quiet "user never blamed" "$T0" "$U"

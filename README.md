@@ -36,12 +36,12 @@ The working VM version stays on `main` and is tagged **`demo-v2`**.
 
 | Component | Role | Talks to the LLM? | Touches the firewall? |
 |---|---|---|---|
-| `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, per-target summaries for the distributed rule and a per-second live summary for the dashboard) | No | No |
-| `detector.py` | Per-source rules, first match wins: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood`; ≥ 1 SYN to a tripwire port (Docker lab: 21, 23, 445, 3389) → `tripwire`. Per-target rule: ≥ 20 ports of one target from ≥ 2 sources with ≥ 3 ports each, none of them ≥ 20 alone → `distributed_scan` for each of those sources | No | No |
-| `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log | No | **Yes** |
+| `sensor.py` | Sniffs the gateway's attacker-side interface, writes per-source 5-second summaries (and, in Docker, per-target summaries for the distributed rule, forged-ARP findings for the MITM rule and a per-second live summary for the dashboard) | No | No |
+| `detector.py` | Per-source rules, first match wins: ≥ 20 distinct SYN ports in a window → `port_scan`; ≥ 50 SYN/s → `syn_flood`; ≥ 1 SYN to a tripwire port (Docker lab: 21, 23, 445, 3389) → `tripwire`. Per-target rule: ≥ 20 ports of one target from ≥ 2 sources with ≥ 3 ports each, none of them ≥ 20 alone → `distributed_scan` for each of those sources. ARP rule: ≥ 1 forged ARP claim (the gateway's IP, or an IP another host used in the last 30 s) → `arp_spoof` for the IP behind that MAC | No | No |
+| `responder.py` | Whitelist → risk level → action ladder → nftables blocklist → SQLite event log; for `arp_spoof` also an ARP blocklist for the MAC and a flush of the poisoned gateway ARP entries | No | **Yes** |
 | `explainer.py` | Explains each block in Turkish (3–4 sentences), number-verified | Yes (numbers only) | No |
 | `specialist.py` | Router picks `PortScanAgent` or `SynFloodAgent` for a second opinion (JSON) | Yes (numbers only) | No |
-| `unblock.py` | Manual unblock, logged to the event table | No | **Yes** |
+| `unblock.py` | Manual unblock (IP, and the MAC of an ARP spoofing block), logged to the event table | No | **Yes** |
 | `policy.py` | Action ladder constants and the repeat count, shared by the responder and the agents (no firewall code) | No | No |
 | `dashboard.py` | Read-only web view of `oasis.db` for the analyst: lab diagram, events, explanations, opinions, active blocks | No | No |
 
@@ -171,7 +171,8 @@ Stop the lab with `docker compose down`. To also delete the event database, add 
 ### Scenario
 
 One command runs a staged attack chain while a normal user browses, checks every phase
-against the event log and prints a PASS/FAIL report (about 2.5 minutes):
+against the event log and prints a PASS/FAIL report (about 2.7 minutes, five attacker
+containers):
 
 ```bash
 bash scripts/scenario.sh
@@ -185,6 +186,7 @@ bash scripts/scenario.sh
 | 3 | The attacker hops to a new IP (a2) and sends one quiet SYN to 3389 | `tripwire`, a2 blocked |
 | 4 | Two more IPs (a3, a4) split a scan, 10 ports each, no tripwire port | `distributed_scan`, a3 and a4 blocked |
 | 5 | The admin unblocks a1, which starts a SYN flood (3000 SYN) | `syn_flood`, a1 blocked again |
+| 6 | MITM attempt: a5 tells the gateway that the user's IP is at a5's MAC (3 forged ARP replies) | `arp_spoof`, a5 blocked, the gateway's entry for the user back at the user's real MAC |
 | all | The normal user | never blamed, still gets HTTP 200 |
 
 The `user` service only exists in the `scenario` compose profile, so a normal
@@ -240,6 +242,7 @@ docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/dashboard:dev
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_sensor.py -v
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_detector.py -v
 docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/agents:dev python3 -m unittest discover -s tests -p test_retry.py -v
+docker run --rm --network none -v "$PWD/tests:/app/tests:ro" oasis/core:dev python3 -m unittest discover -s tests -p test_arp.py -v
 ```
 
 ## Test results
@@ -447,6 +450,43 @@ labelled `(verified) [retry]`; a failed retry is marked in the fallback (`tekrar
 The retry helps but is not a cure: when Gemini is overloaded, a second try 2 s later can
 fail too. A longer delay or a second retry would trade more of these for slower fallbacks.
 
+### MITM / ARP spoofing
+
+With `OASIS_ARP_FILE` set, the sensor also reads every ARP message on the gateway's
+attacker-side interface (each one claims "this IP is at this MAC") and flags two kinds of
+forged claims, per window and per sending MAC:
+
+- **gateway impersonation**: the gateway's own IP from a MAC that is not the gateway's;
+- **address conflict**: an IP that another MAC used within the last 30 s.
+
+The offender is found by its MAC: the sensor remembers the first IP each MAC used, and never
+overwrites it, so a MITM that relays someone else's packets is not given their IP. The
+detector raises `arp_spoof` (risk high, 30-minute start). The responder then also adds the
+MAC to an nftables `arp` blocklist (the gateway ignores its ARP for the block's duration)
+and flushes the gateway's ARP entries for the claimed IPs, so they are learned again from
+their real owners. Only counts go to the LLM; MACs and IPs stay in the database.
+
+What a forged claim did to the gateway in test M3, and how the response undid it:
+
+| Moment | Gateway's ARP entry for the user | |
+|---|---|---|
+| before | the user's real MAC | normal |
+| 1 s after 3 forged replies | **the attacker's MAC** | poisoned: replies to the user would go to the attacker |
+| after the responder (about 5 s) | the user's real MAC again | entry flushed and learned again |
+
+| # | Test | Result |
+|---|---|---|
+| U6 | 14 unit tests: VM learns nothing; impersonation; own ARP and probes ignored; normal replies learned; conflict only within 30 s; relayed packets do not change who the attacker is; detector cases; responder: bad MACs never reach a command, MAC block with the same timeout, only valid IPs flushed | Pass |
+| R1 | VM settings: sensor, detector and responder identical to the previous commit; explainer payloads and all template texts of 46 stored events unchanged; specialist payloads differ only by one new lab-baseline number (`normal_traffic_forged_arp_claims: 0`) | Pass |
+| M1 | 30 s of normal traffic (user browsing, attacker pinging), with real ARP between the hosts | no finding, no alert |
+| M2 | 3 forged broadcasts "10.10.1.254 is at my MAC" | `gw_impersonation` 3, `arp_spoof`, IP and MAC blocked for 30 min, ping lost |
+| M3 | 3 forged replies to the gateway claiming the user's IP | `binding_conflicts` 3, `arp_spoof` for the attacker (not the user), poisoned entry repaired, user gets HTTP 200 |
+| M4 | The blocked MAC sends the same forged replies again | the gateway's entry stays correct (ARP dropped by nftables); `skip_already_blocked` |
+| R2 | LLM payloads: three counts only; no IP, no MAC, no free text | Pass |
+| R3 | Agents on the two events: 4 / 4 `(verified)`, one after a retry | Pass |
+| R4 | Dashboard lists the `arp_spoof` events | Pass |
+| S | Scenario with the new phase 6, run twice: 11 / 11 PASS each (2 min 38 s), LLM 12 / 12 verified both times | Pass |
+
 ## Known limitations
 
 - **Simple detection.** There are two rules with fixed thresholds over 5-second windows.
@@ -470,7 +510,18 @@ fail too. A longer delay or a second retry would trade more of these for slower 
 - **Recycled lab IPs keep their history.** Docker hands a freed address to the next
   attacker container, so a new container can inherit an old IP's recent blocks and get a
   longer block on its first scan.
-- **Only three detection rules** (port scan, SYN flood, tripwire). There is no detection
+- **ARP spoofing: what the gateway cannot see or fix.** It only sees ARP that reaches its
+  own interface: a forged reply sent straight to another host (for example telling the user
+  "I am the gateway" by unicast) is invisible to it, and it cannot repair other hosts' ARP
+  caches; that needs switch-level protection such as dynamic ARP inspection or static
+  entries. A MAC that never sent its own traffic cannot be tied to an IP, so it is logged
+  but not blocked. A container recreated with an IP that another MAC used less than 30 s
+  earlier would look like a conflict. Only the attacker-side network is watched, and IPv6
+  neighbour discovery is not covered. The specialist payload's lab baseline is shared by
+  all attack types, so ARP and tripwire baseline numbers also appear for other events.
+  One LLM explanation translated "binding conflict" as "bağışıklık çakışması" (wrong word).
+- **Only five detection rules** (port scan, SYN flood, tripwire, distributed scan, ARP
+  spoofing). There is no detection
   for UDP floods, application-layer attacks, brute force and similar attacks.
 - **One direction only.** The sensor watches traffic from `attacker-net`. Traffic that
   starts on the victim side is not analyzed. The lab is IPv4 only; IPv6 is dropped.
@@ -561,6 +612,8 @@ fail too. A longer delay or a second retry would trade more of these for slower 
   source that took part is blocked, a normal user on the same target is not;
   `DistributedScanAgent` for the specialist
 - One LLM retry after HTTP 5xx / timeouts (`src/retry.py`), with `[retry]` in the label
+- MITM / ARP spoofing: gateway impersonation and address conflicts detected, offender blocked
+  by IP and MAC, poisoned gateway ARP entries repaired; `ArpSpoofAgent`; scenario phase 6
 - Scenario script (`scripts/scenario.sh`): normal user plus a staged attack chain with IP
   hopping, checked phase by phase, PASS/FAIL report; `user` service in a compose profile
 
@@ -568,7 +621,7 @@ fail too. A longer delay or a second retry would trade more of these for slower 
 
 - Update the default Gemini model before the `gemini-2.5-flash` shutdown
 - Longer sliding window per target, to catch scans spread over several windows
-- MITM / ARP spoofing detection
+- Lab baseline per attack type in the specialist payload
 - Further README and documentation edits
 
 ## AI assistance

@@ -4,7 +4,8 @@
 Per-source rules are checked in order and the first match wins: a big scan that also
 touches a tripwire port is reported as the more telling port_scan. The distributed rule
 reads per-target windows (OASIS_TARGET_FILE) and only fires when no single source
-already reached the port-scan threshold.
+already reached the port-scan threshold. The ARP rule reads forged-ARP findings
+(OASIS_ARP_FILE) and blames the IP the offending MAC first used.
 """
 import json
 import os
@@ -22,6 +23,8 @@ DIST_MIN_SOURCE_PORTS = 3     # a source counts as a contributor from 3 ports (a
 DIST_MIN_CONTRIBUTORS = 2
 TARGETS_FILE = os.environ.get("OASIS_TARGET_FILE") or None   # unset (VM): rule off
 SENSOR_WINDOW = 5             # seconds per window (sensor.WINDOW)
+ARP_FILE = os.environ.get("OASIS_ARP_FILE") or None          # unset (VM): ARP rule off
+ARP_SPOOF_MIN = 1             # one forged claim is enough: normal hosts never send one
 # Sources that never raise alerts; OASIS_WHITELIST (comma-separated) overrides.
 WHITELIST = {h.strip() for h in os.environ.get("OASIS_WHITELIST", "10.0.1.1").split(",")
              if h.strip()}
@@ -94,6 +97,37 @@ def check_target(rec):
     return alerts
 
 
+def check_arp(rec):
+    """Return an arp_spoof alert for the IP behind the offending MAC (or an empty list)."""
+    forged = rec["gw_impersonation"] + rec["binding_conflicts"]
+    if forged < ARP_SPOOF_MIN:
+        return []
+    ip = rec.get("source_ip")
+    if not ip:
+        print(f"ARP spoof from {rec['mac']}: no IP seen from it yet, cannot block", flush=True)
+        return []
+    if ip in WHITELIST:
+        return []
+    kinds = []
+    if rec["gw_impersonation"]:
+        kinds.append(f"{rec['gw_impersonation']} claim(s) of the gateway's IP")
+    if rec["binding_conflicts"]:
+        kinds.append(f"{rec['binding_conflicts']} claim(s) of an IP in use by another host")
+    return [{
+        "time": rec["window_end"],
+        "source_ip": ip,
+        "attack_type": "arp_spoof",
+        "reason": "forged ARP: " + ", ".join(kinds) + f" (threshold {ARP_SPOOF_MIN})",
+        "evidence": {
+            "window_start": rec["window_start"], "window_end": rec["window_end"],
+            "mac": rec["mac"], "claimed_ip_list": rec["claimed_ip_list"],   # for the responder
+            "gw_impersonation": rec["gw_impersonation"],
+            "binding_conflicts": rec["binding_conflicts"],
+            "arp_claimed_ips": rec["arp_claimed_ips"],
+        },
+    }]
+
+
 def emit(alert, out):
     line = json.dumps(alert)
     print("ALERT", line, flush=True)
@@ -111,6 +145,8 @@ def main():
     inputs = [(WINDOWS_FILE, check_window)]
     if TARGETS_FILE:
         inputs.append((TARGETS_FILE, check_target))
+    if ARP_FILE:
+        inputs.append((ARP_FILE, check_arp))
     with open(ALERTS_FILE, "a") as out:
         files = []
         for path, rule in inputs:
@@ -122,6 +158,8 @@ def main():
             print("Detector watching for new windows. Ctrl+C to stop.", flush=True)
             if TARGETS_FILE:
                 print(f"Also watching per-target windows: {TARGETS_FILE}", flush=True)
+            if ARP_FILE:
+                print(f"Also watching ARP findings: {ARP_FILE}", flush=True)
         while True:
             idle = True
             for f, rule in files:
